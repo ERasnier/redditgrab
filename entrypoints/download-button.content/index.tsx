@@ -2,6 +2,7 @@ import "~/assets/tailwind.css";
 import ReactDOM from "react-dom/client";
 import type { MediaContentType } from "~/types";
 import DownloadButton from "@/components/download-button";
+import OldRedditDownloadButton from "@/components/old-reddit-download-button";
 import { onMessage } from "webext-bridge/content-script";
 import { Selectors } from "@/utils/constants";
 import {
@@ -29,7 +30,15 @@ import {
   getSearchThingId,
   findSearchRowByThingId,
   extractSearchResultMedia,
+  type SearchResultMedia,
 } from "@/utils/search-scraping";
+import {
+  isOldReddit,
+  getOldRedditPosts,
+  getOldRedditThingId,
+  isOldRedditSelfPost,
+  extractOldRedditPostMedia,
+} from "@/utils/old-reddit";
 
 const scrollToLoadMore = (scrollUp: boolean) => {
   if (scrollUp) {
@@ -270,14 +279,21 @@ const refreshDownloadedMarkers = async () => {
   }
 
   const ids = new Set(await processedPostIds.getValue());
-  const onSearch = isSearchResultsPage();
-  const targets = onSearch
-    ? getSearchResultRoots()
-    : Array.from(document.querySelectorAll("shreddit-post"));
+  const onOldReddit = isOldReddit();
+  const onSearch = !onOldReddit && isSearchResultsPage();
+  const targets = onOldReddit
+    ? getOldRedditPosts()
+    : onSearch
+      ? getSearchResultRoots()
+      : Array.from(document.querySelectorAll("shreddit-post"));
 
   for (const el of targets) {
     const target = el as HTMLElement;
-    const id = onSearch ? getSearchThingId(target) : getPostIdentifier(target);
+    const id = onOldReddit
+      ? getOldRedditThingId(target)
+      : onSearch
+        ? getSearchThingId(target)
+        : getPostIdentifier(target);
     const box = resolveBoxElement(target);
     const hasBadge = !!box.querySelector(`:scope > [${RG_DOWNLOADED_ATTR}]`);
     if (id && ids.has(id)) {
@@ -295,9 +311,23 @@ const refreshDownloadedMarkers = async () => {
 // processedPostIds so these never get a "downloaded" marker.
 const unsupportedThingIds = new Set<string>();
 
-const scanSearchPageMedia = async (skipPostIds: string[] = []) => {
-  const roots = getSearchResultRoots();
-  logger.log(`Search scan: ${roots.length} result roots found`);
+/**
+ * Pages whose posts carry no usable media in the DOM (search results, old
+ * Reddit): each post is identified by its thing id and resolved via the post
+ * JSON.
+ */
+type ApiResolvedPostSource = {
+  label: string;
+  roots: Element[];
+  getThingId: (root: Element) => string | null;
+  extractMedia: (root: Element) => Promise<SearchResultMedia | null>;
+};
+
+const scanApiResolvedPosts = async (
+  { label, roots, getThingId, extractMedia }: ApiResolvedPostSource,
+  skipPostIds: string[] = [],
+) => {
+  logger.log(`${label} scan: ${roots.length} result roots found`);
 
   // When force download is on, ignore the history so already-downloaded posts
   // get re-grabbed.
@@ -322,7 +352,7 @@ const scanSearchPageMedia = async (skipPostIds: string[] = []) => {
       roots.map(async (root) => {
         // Cheap, fetch-free checks first so we never re-fetch JSON/HLS for posts
         // already downloaded or filtered out (re-fetching invites rate limiting).
-        const thingId = getSearchThingId(root);
+        const thingId = getThingId(root);
         if (!thingId) return null;
 
         if (processedSet.has(thingId)) {
@@ -345,7 +375,7 @@ const scanSearchPageMedia = async (skipPostIds: string[] = []) => {
           return null;
         }
 
-        const media = await extractSearchResultMedia(root);
+        const media = await extractMedia(root);
         if (!media) {
           // No downloadable media this session: don't re-fetch it next cycle.
           unsupportedThingIds.add(thingId);
@@ -370,7 +400,9 @@ const scanSearchPageMedia = async (skipPostIds: string[] = []) => {
     ),
   );
 
-  logger.log(`Search scan: ${mediaCount} of ${roots.length} resolved to media`);
+  logger.log(
+    `${label} scan: ${mediaCount} of ${roots.length} resolved to media`,
+  );
 
   return {
     success: true,
@@ -436,7 +468,45 @@ export default defineContentScript({
       return null;
     };
 
+    const attachOldRedditButtons = async () => {
+      const posts = getOldRedditPosts();
+
+      await Promise.all(
+        posts.map(async (post) => {
+          if (mountedUIs.has(post) || isOldRedditSelfPost(post)) return;
+          const actions = post.querySelector(".flat-list.buttons");
+          if (!actions) return;
+
+          const ui = await createShadowRootUi(ctx, {
+            name: "media-downloader-button",
+            position: "inline",
+            anchor: actions,
+            append: "last",
+            onMount: (container) => {
+              const app = document.createElement("li");
+              container.className = "inline-block align-middle";
+              container.append(app);
+              const root = ReactDOM.createRoot(app);
+              root.render(<OldRedditDownloadButton post={post} />);
+              return root;
+            },
+            onRemove: (root) => {
+              root?.unmount();
+            },
+          });
+
+          ui.mount();
+          mountedUIs.add(post);
+        }),
+      );
+    };
+
     const attachButtons = async () => {
+      if (isOldReddit()) {
+        await attachOldRedditButtons();
+        return;
+      }
+
       const elements = document.querySelectorAll("shreddit-post");
 
       await Promise.all(
@@ -558,8 +628,28 @@ export default defineContentScript({
     onMessage("SCAN_PAGE_MEDIA", async ({ data }) => {
       const { scrollUp = false, anchorPostId, skipPostIds = [] } = data ?? {};
 
+      if (isOldReddit()) {
+        return scanApiResolvedPosts(
+          {
+            label: "Old Reddit",
+            roots: getOldRedditPosts(),
+            getThingId: getOldRedditThingId,
+            extractMedia: extractOldRedditPostMedia,
+          },
+          skipPostIds,
+        );
+      }
+
       if (isSearchResultsPage()) {
-        return scanSearchPageMedia(skipPostIds);
+        return scanApiResolvedPosts(
+          {
+            label: "Search",
+            roots: getSearchResultRoots(),
+            getThingId: getSearchThingId,
+            extractMedia: extractSearchResultMedia,
+          },
+          skipPostIds,
+        );
       }
 
       let postsArray = Array.from(document.querySelectorAll("shreddit-post"));
