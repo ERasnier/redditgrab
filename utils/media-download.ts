@@ -1,6 +1,10 @@
 import { addTextToImage, addTextToVideo } from "./text-overlays";
 import { logger } from "./logger";
-import { createBlobUrl } from "./blob-utils";
+import {
+  createBlobUrl,
+  downloadAndRelease,
+  revokeIfObjectUrl,
+} from "./blob-utils";
 import { DownloadImageOptions, DownloadVideoOptions } from "@/types";
 import { compact } from "es-toolkit";
 
@@ -300,11 +304,7 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
           filename: outputPath,
         };
       }
-      await browser.downloads.download({
-        url: dataUrl,
-        filename: outputPath,
-        saveAs: false,
-      });
+      await downloadAndRelease(dataUrl, outputPath);
     }),
   );
 
@@ -381,6 +381,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
     const outputPath = sanitizeDownloadPath(`${folderDestination}/${filename}`);
 
     // If text overlay is enabled and we have a title, process the video
+    let downloadUrl = url;
     if (addTitleToVideo && postTitle) {
       try {
         logger.log("Adding text overlay to video:", postTitle);
@@ -390,49 +391,24 @@ export async function downloadVideo(options: DownloadVideoOptions) {
 
         const processedVideoBlob = await addTextToVideo(videoBlob, postTitle);
 
-        const dataUrl = await createBlobUrl(processedVideoBlob);
-
-        if (offscreen) {
-          return {
-            url: dataUrl,
-            filename: outputPath,
-          };
-        }
-        await browser.downloads.download({
-          url: dataUrl,
-          filename: outputPath,
-          saveAs: false,
-        });
+        downloadUrl = await createBlobUrl(processedVideoBlob);
+        // The unprocessed video is no longer needed; free it now.
+        revokeIfObjectUrl(url);
       } catch (error) {
         logger.error(
           "Failed to add text to video, downloading original:",
           error,
         );
-        if (offscreen) {
-          return {
-            url,
-            filename: outputPath,
-          };
-        }
-        await browser.downloads.download({
-          url,
-          filename: outputPath,
-          saveAs: false,
-        });
       }
-    } else {
-      if (offscreen) {
-        return {
-          url,
-          filename: outputPath,
-        };
-      }
-      await browser.downloads.download({
-        url,
-        filename: outputPath,
-        saveAs: false,
-      });
     }
+
+    if (offscreen) {
+      return {
+        url: downloadUrl,
+        filename: outputPath,
+      };
+    }
+    await downloadAndRelease(downloadUrl, outputPath);
   } catch (err) {
     // Rethrow so the failure propagates: swallowing it made Firefox report a
     // silent success and the failed post was never retried/skipped.
