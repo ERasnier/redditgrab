@@ -123,8 +123,8 @@ const waitForRequestSlot = async () => {
 
 const MAX_RETRY_AFTER_MS = 30_000;
 
-const fetchPostJson = async (id: string) => {
-  const url = `https://www.reddit.com/comments/${id}/.json?raw_json=1`;
+const fetchPostJson = async (id: string, extraQuery = "") => {
+  const url = `https://www.reddit.com/comments/${id}/.json?raw_json=1${extraQuery}`;
   await waitForRequestSlot();
   const res = await fetch(url, { credentials: "include" });
   if (res.status !== 429) return res;
@@ -187,4 +187,27 @@ export const fetchPostMedia = async (
       ? format(fromUnixTime(post.created_utc), "yyyy-MM-dd")
       : "",
   };
+};
+
+/**
+ * Fetch a post's full listing (post + comment tree) for archiving. Returns the
+ * raw `[post listing, comments listing]` JSON, or null on failure.
+ */
+export const fetchPostThread = async (
+  thingId: string,
+): Promise<unknown[] | null> => {
+  const id = thingId.replace(/^t3_/, "");
+  try {
+    const res = await fetchPostJson(id, "&limit=500");
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!res.ok || !contentType.includes("json")) {
+      logger.warn(`Post thread unavailable for ${id} (status ${res.status})`);
+      return null;
+    }
+    const json = await res.json();
+    return Array.isArray(json) ? json : null;
+  } catch (error) {
+    logger.warn(`Failed to fetch post thread for ${id}`, error);
+    return null;
+  }
 };

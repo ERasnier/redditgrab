@@ -92,3 +92,22 @@ export async function downloadAndRelease(url: string, filename: string) {
     revokeIfObjectUrl(url);
   }
 }
+
+/**
+ * URL for a generated text file. Uses an object URL where available; Chrome's
+ * background service worker has neither URL.createObjectURL nor FileReader, so
+ * it gets a base64 data URL instead.
+ */
+export function createTextFileUrl(text: string, mimeType: string): string {
+  if (typeof URL !== "undefined" && URL.createObjectURL) {
+    return URL.createObjectURL(new Blob([text], { type: mimeType }));
+  }
+
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+  }
+  return `data:${mimeType};base64,${btoa(binary)}`;
+}

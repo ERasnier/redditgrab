@@ -1,6 +1,11 @@
 import { MESSAGE_TARGET, OFFSCREEN_KEYS } from "@/utils/constants";
 
-export type MediaContentType = "video" | "single-image" | "multiple-images";
+// "text" is a post with no downloadable media; only its archive is saved.
+export type MediaContentType =
+  | "video"
+  | "single-image"
+  | "multiple-images"
+  | "text";
 
 export type DownloadVideoOptions = {
   url: string;

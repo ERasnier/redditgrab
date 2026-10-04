@@ -15,6 +15,7 @@ export const SettingsSchema = type({
   showDownloadedMarkers: "boolean",
   forceDownloadProcessed: "boolean",
   requestDelaySeconds: "0 <= number <= 60",
+  savePostArchive: "boolean",
   useDateRange: "boolean",
   // Accept number or undefined for timestamps, validate in pipe
   "dateRangeStart?": "number | undefined",

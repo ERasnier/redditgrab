@@ -71,3 +71,8 @@ export const requestDelaySeconds = storage.defineItem(
   "local:requestDelaySeconds",
   { fallback: 1 },
 );
+
+// Also save each downloaded post's text and comments as a standalone HTML page.
+export const savePostArchive = storage.defineItem("local:savePostArchive", {
+  fallback: false,
+});

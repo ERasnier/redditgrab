@@ -12,6 +12,7 @@ export function mediaTypeMatchesMassDownloadFilter(
   filter: MassDownloadMediaFilterValue,
 ): boolean {
   if (filter === "all") return true;
+  if (mediaType === "text") return false;
   if (filter === "videos") return mediaType === "video";
   return mediaType === "single-image" || mediaType === "multiple-images";
 }

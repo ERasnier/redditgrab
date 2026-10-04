@@ -12,6 +12,7 @@ import {
   showDownloadedMarkers as showDownloadedMarkersStorage,
   forceDownloadProcessed as forceDownloadProcessedStorage,
   requestDelaySeconds as requestDelaySecondsStorage,
+  savePostArchive as savePostArchiveStorage,
   useDateRange as useDateRangeStorage,
   dateRangeStart as dateRangeStartStorage,
   dateRangeEnd as dateRangeEndStorage,
@@ -90,6 +91,10 @@ const debouncedSaveRequestDelaySeconds = debounce(async (value: number) => {
   await requestDelaySecondsStorage.setValue(value);
 }, 500);
 
+const debouncedSaveSavePostArchive = debounce(async (value: boolean) => {
+  await savePostArchiveStorage.setValue(value);
+}, 500);
+
 const debouncedSaveUseDateRange = debounce(async (value: boolean) => {
   await useDateRangeStorage.setValue(value);
 }, 500);
@@ -123,6 +128,7 @@ function SidebarApp() {
       showDownloadedMarkers: false,
       forceDownloadProcessed: false,
       requestDelaySeconds: 1,
+      savePostArchive: false,
       useDateRange: false,
       dateRangeStart: undefined,
       dateRangeEnd: undefined,
@@ -150,6 +156,7 @@ function SidebarApp() {
         showDownloadedMarkers,
         forceDownloadProcessed,
         requestDelaySeconds,
+        savePostArchive,
         useDateRange,
         dateRangeStart,
         dateRangeEnd,
@@ -164,6 +171,7 @@ function SidebarApp() {
         showDownloadedMarkersStorage.getValue(),
         forceDownloadProcessedStorage.getValue(),
         requestDelaySecondsStorage.getValue(),
+        savePostArchiveStorage.getValue(),
         useDateRangeStorage.getValue(),
         dateRangeStartStorage.getValue(),
         dateRangeEndStorage.getValue(),
@@ -185,6 +193,7 @@ function SidebarApp() {
         showDownloadedMarkers: showDownloadedMarkers || false,
         forceDownloadProcessed: forceDownloadProcessed || false,
         requestDelaySeconds: requestDelaySeconds ?? 1,
+        savePostArchive: savePostArchive || false,
         useDateRange: useDateRange || false,
         dateRangeStart: dateRangeStart ? parseInt(dateRangeStart) : undefined,
         dateRangeEnd: dateRangeEnd ? parseInt(dateRangeEnd) : undefined,
@@ -241,6 +250,9 @@ function SidebarApp() {
             ) {
               debouncedSaveRequestDelaySeconds(value.requestDelaySeconds);
             }
+            break;
+          case "savePostArchive":
+            debouncedSaveSavePostArchive(value.savePostArchive || false);
             break;
           case "useDateRange":
             debouncedSaveUseDateRange(value.useDateRange || false);
@@ -509,6 +521,8 @@ function SidebarApp() {
                 addTitleToVideos: form.getValues("addTitleToVideos"),
                 postTitle: mediaItem.postTitle,
                 postAuthor: mediaItem.postAuthor,
+                postId: mediaItem.mediaPostId,
+                savePostArchive: form.getValues("savePostArchive"),
               },
               "background",
             );
@@ -997,6 +1011,41 @@ function SidebarApp() {
                           posts you've already downloaded get grabbed again.
                           Lets you redownload a page without clearing your
                           history.
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="savePostArchive"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-start space-x-3 space-y-0">
+                <FormControl>
+                  <Checkbox
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+                <div className="space-y-1 leading-none flex items-center gap-1.5">
+                  <FormLabel>Save post text &amp; comments</FormLabel>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="inline-flex text-gray-500 dark:text-gray-400 cursor-help">
+                          <Icon icon="lucide:info" className="size-3.5" />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">
+                          Saves each post as an HTML page (title, text, images
+                          and comments, no ads or sidebars) next to its media.
+                          Print it to get a PDF. Mass download on feeds and old
+                          Reddit also saves text-only posts.
                         </p>
                       </TooltipContent>
                     </Tooltip>

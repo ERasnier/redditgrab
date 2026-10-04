@@ -6,6 +6,7 @@ import {
   addTitleToImages as addTitleToImagesStorage,
   addTitleToVideos as addTitleToVideosStorage,
   markDownloadedAsVisited as markDownloadedAsVisitedStorage,
+  savePostArchive as savePostArchiveStorage,
   addProcessedPostId,
 } from "@/utils/storage";
 import { getPostIdentifier } from "@/utils/post-identifier";
@@ -46,6 +47,7 @@ const DownloadButton = ({
       const useGalleryFolders = await useGalleryFoldersStorage.getValue();
       const addTitleToImages = await addTitleToImagesStorage.getValue();
       const addTitleToVideos = await addTitleToVideosStorage.getValue();
+      const savePostArchive = await savePostArchiveStorage.getValue();
 
       // Process folder destination with variable substitution
       const postElement = mediaContainer.closest("shreddit-post");
@@ -79,6 +81,8 @@ const DownloadButton = ({
           addTitleToVideos,
           postTitle,
           postAuthor,
+          postId: postElement ? getPostIdentifier(postElement) : undefined,
+          savePostArchive,
         },
         "background",
       );

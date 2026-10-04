@@ -12,6 +12,7 @@ import {
   dateRangeEnd,
   showDownloadedMarkers,
   forceDownloadProcessed,
+  savePostArchive,
 } from "@/utils/storage";
 import { compact } from "es-toolkit";
 import { logger } from "@/utils/logger";
@@ -634,7 +635,10 @@ export default defineContentScript({
             label: "Old Reddit",
             roots: getOldRedditPosts(),
             getThingId: getOldRedditThingId,
-            extractMedia: extractOldRedditPostMedia,
+            extractMedia: async (root) =>
+              extractOldRedditPostMedia(root, {
+                includeTextPosts: await savePostArchive.getValue(),
+              }),
           },
           skipPostIds,
         );
@@ -686,6 +690,8 @@ export default defineContentScript({
       // Posts that already failed this run, so one failing post can't loop forever.
       const skipSet = new Set(skipPostIds);
 
+      const archiveTextPosts = await savePostArchive.getValue();
+
       // Get date range settings
       const useDateRangeFilter = await useDateRange.getValue();
       const startDate = useDateRangeFilter
@@ -700,48 +706,49 @@ export default defineContentScript({
           postsArray.map(async (post, index) => {
             const mediaContainer = getMediaContainer(post);
 
-            if (mediaContainer) {
-              const uniqueId = setPostIdentifier(post);
+            // Posts without media are only collected when their text is being
+            // archived.
+            if (!mediaContainer && !archiveTextPosts) return null;
 
-              // Skip if we've already processed this post
-              if (processedSet.has(uniqueId)) {
-                logger.log(`Skipping already processed post: ${uniqueId}`);
-                return null;
-              }
+            const uniqueId = setPostIdentifier(post);
 
-              if (skipSet.has(uniqueId)) {
-                logger.log(`Skipping post that failed to download: ${uniqueId}`);
-                return null;
-              }
-
-              // Check if post is within date range
-              if (!isPostInDateRange(post, startDate, endDate)) {
-                logger.log(`Skipping post outside date range: ${uniqueId}`);
-                return null;
-              }
-
-              const subredditName = getSubredditNameFromContainer(
-                mediaContainer.element.closest("shreddit-post") ||
-                  mediaContainer.element,
-              );
-
-              mediaCount++;
-
-              return {
-                urls: await getDownloadUrlsFromContainer(
-                  mediaContainer.element,
-                  mediaContainer.type,
-                ),
-                type: mediaContainer.type,
-                subredditName,
-                mediaPostId: uniqueId,
-                postTitle: getPostTitle(post),
-                postAuthor: getPostAuthor(post),
-                postDate: getPostDate(post),
-              };
+            // Skip if we've already processed this post
+            if (processedSet.has(uniqueId)) {
+              logger.log(`Skipping already processed post: ${uniqueId}`);
+              return null;
             }
 
-            return null;
+            if (skipSet.has(uniqueId)) {
+              logger.log(`Skipping post that failed to download: ${uniqueId}`);
+              return null;
+            }
+
+            // Check if post is within date range
+            if (!isPostInDateRange(post, startDate, endDate)) {
+              logger.log(`Skipping post outside date range: ${uniqueId}`);
+              return null;
+            }
+
+            const subredditName = getSubredditNameFromContainer(
+              mediaContainer?.element.closest("shreddit-post") || post,
+            );
+
+            mediaCount++;
+
+            return {
+              urls: mediaContainer
+                ? await getDownloadUrlsFromContainer(
+                    mediaContainer.element,
+                    mediaContainer.type,
+                  )
+                : [],
+              type: mediaContainer?.type ?? ("text" as const),
+              subredditName,
+              mediaPostId: uniqueId,
+              postTitle: getPostTitle(post),
+              postAuthor: getPostAuthor(post),
+              postDate: getPostDate(post),
+            };
           }),
         ),
       );

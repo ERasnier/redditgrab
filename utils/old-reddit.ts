@@ -39,16 +39,39 @@ const getOldRedditPostDate = (post: Element): string | undefined => {
   return isValid(date) ? format(date, "yyyy-MM-dd") : undefined;
 };
 
-/** Resolve a post row to downloadable media, or null when it has none. */
+const getOldRedditTextPost = (
+  post: Element,
+  thingId: string,
+): SearchResultMedia => ({
+  type: "text",
+  urls: [],
+  mediaPostId: thingId,
+  subredditName: post.getAttribute("data-subreddit") || "unknown",
+  postTitle: post.querySelector("a.title")?.textContent?.trim() || "",
+  postAuthor: post.getAttribute("data-author") || undefined,
+  postDate: getOldRedditPostDate(post),
+});
+
+/**
+ * Resolve a post row to downloadable media, or null when it has none. With
+ * `includeTextPosts`, posts without media come back as "text" items so their
+ * archive can still be saved.
+ */
 export const extractOldRedditPostMedia = async (
   post: Element,
+  { includeTextPosts = false }: { includeTextPosts?: boolean } = {},
 ): Promise<SearchResultMedia | null> => {
   const thingId = getOldRedditThingId(post);
-  if (!thingId || isOldRedditSelfPost(post)) return null;
+  if (!thingId) return null;
+  if (isOldRedditSelfPost(post)) {
+    return includeTextPosts ? getOldRedditTextPost(post, thingId) : null;
+  }
 
   try {
     const media = await fetchPostMedia(thingId);
-    if (!media) return null;
+    if (!media) {
+      return includeTextPosts ? getOldRedditTextPost(post, thingId) : null;
+    }
 
     return {
       type: media.type,

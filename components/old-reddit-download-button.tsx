@@ -6,6 +6,7 @@ import {
   addTitleToImages as addTitleToImagesStorage,
   addTitleToVideos as addTitleToVideosStorage,
   markDownloadedAsVisited as markDownloadedAsVisitedStorage,
+  savePostArchive as savePostArchiveStorage,
   addProcessedPostId,
 } from "@/utils/storage";
 import { extractOldRedditPostMedia } from "@/utils/old-reddit";
@@ -47,11 +48,13 @@ const OldRedditDownloadButton = ({ post }: { post: Element }) => {
         useGalleryFolders,
         addTitleToImages,
         addTitleToVideos,
+        savePostArchive,
       ] = await Promise.all([
         folderDestinationStorage.getValue(),
         useGalleryFoldersStorage.getValue(),
         addTitleToImagesStorage.getValue(),
         addTitleToVideosStorage.getValue(),
+        savePostArchiveStorage.getValue(),
       ]);
 
       const response = await sendMessage(
@@ -74,6 +77,8 @@ const OldRedditDownloadButton = ({ post }: { post: Element }) => {
           addTitleToVideos,
           postTitle: media.postTitle,
           postAuthor: media.postAuthor,
+          postId: media.mediaPostId,
+          savePostArchive,
         },
         "background",
       );
