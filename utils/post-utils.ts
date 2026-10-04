@@ -33,7 +33,16 @@ export const getPostTitle = (post: Element): string => {
  * @returns The post author username or unknown-user if not found
  */
 export const getPostAuthor = (post: Element): string => {
-  return post.getAttribute("author") || "unknown-user";
+  // shreddit-post carries the username as an attribute. Elements without it
+  // (e.g. search result rows) fall back to the profile link in the markup.
+  const fromAttribute = post.getAttribute("author");
+  if (fromAttribute) return fromAttribute;
+
+  const authorText = post
+    .querySelector('a[href*="/user/"]')
+    ?.textContent?.trim()
+    .replace(/^u\//, "");
+  return authorText || "unknown-user";
 };
 
 /**

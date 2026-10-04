@@ -490,6 +490,7 @@ function SidebarApp() {
                 addTitleToImages: form.getValues("addTitleToImages"),
                 addTitleToVideos: form.getValues("addTitleToVideos"),
                 postTitle: mediaItem.postTitle,
+                postAuthor: mediaItem.postAuthor,
               },
               "background",
             );
@@ -793,7 +794,7 @@ function SidebarApp() {
                 </FormControl>
                 <FormDescription>
                   Available: {"{subreddit}"}, {"{timestamp}"}, {"{title}"},{" "}
-                  {"{filename}"}
+                  {"{user}"}, {"{filename}"}
                 </FormDescription>
                 <FormMessage />
               </FormItem>

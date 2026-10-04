@@ -72,6 +72,7 @@ async function handleDownloadRequest(data: DownloadRequestMessage) {
       useGalleryFolders: data.useGalleryFolders,
       addTitleToImages: data.addTitleToImages,
       postTitle: data.postTitle,
+      postAuthor: data.postAuthor,
       filenamePattern: await filenamePattern.getValue(),
     } as const satisfies Parameters<typeof downloadGalleryImages>[0];
 
@@ -89,6 +90,7 @@ async function handleDownloadRequest(data: DownloadRequestMessage) {
       subredditName,
       addTitleToVideo: data.addTitleToVideos,
       postTitle: data.postTitle || "",
+      postAuthor: data.postAuthor,
       filenamePattern: await filenamePattern.getValue(),
     } as const satisfies Parameters<typeof downloadVideo>[0];
 

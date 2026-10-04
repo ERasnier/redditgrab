@@ -8,6 +8,7 @@ export type DownloadVideoOptions = {
   subredditName: string;
   addTitleToVideo: boolean;
   postTitle: string;
+  postAuthor?: string;
   filenamePattern: string;
   offscreen?: boolean;
 };
@@ -19,6 +20,7 @@ export type DownloadImageOptions = {
   useGalleryFolders?: boolean;
   addTitleToImages?: boolean;
   postTitle?: string;
+  postAuthor?: string;
   filenamePattern: string;
   offscreen?: boolean;
 };
