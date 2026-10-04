@@ -2,6 +2,7 @@ import type { MediaContentType } from "@/types";
 import { getHighestQualityHLS } from "./media-download";
 import { logger } from "./logger";
 import { format, fromUnixTime } from "date-fns";
+import { requestDelaySeconds } from "./storage";
 
 /**
  * Search results expose only a thumbnail for videos, redgifs, and single images
@@ -106,6 +107,40 @@ const extractMediaUrls = async (
   return null;
 };
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Earliest time the next post lookup may start. Scans resolve many posts at
+// once; spacing the requests out keeps Reddit from rate limiting the page.
+let nextRequestAt = 0;
+
+const waitForRequestSlot = async () => {
+  const delayMs = Math.max(0, (await requestDelaySeconds.getValue()) * 1000);
+  const now = Date.now();
+  const startAt = Math.max(now, nextRequestAt);
+  nextRequestAt = startAt + delayMs;
+  if (startAt > now) await sleep(startAt - now);
+};
+
+const MAX_RETRY_AFTER_MS = 30_000;
+
+const fetchPostJson = async (id: string) => {
+  const url = `https://www.reddit.com/comments/${id}/.json?raw_json=1`;
+  await waitForRequestSlot();
+  const res = await fetch(url, { credentials: "include" });
+  if (res.status !== 429) return res;
+
+  // Rate limited: wait as long as Reddit asks (capped), then retry once.
+  const retryAfterSeconds = Number(res.headers.get("retry-after"));
+  const waitMs =
+    Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+      ? Math.min(retryAfterSeconds * 1000, MAX_RETRY_AFTER_MS)
+      : 5000;
+  logger.warn(`Rate limited fetching ${id}, retrying in ${waitMs}ms`);
+  nextRequestAt = Math.max(nextRequestAt, Date.now() + waitMs);
+  await waitForRequestSlot();
+  return fetch(url, { credentials: "include" });
+};
+
 /**
  * Fetch full media for a post by its thing id. Returns null for unsupported
  * media (external hosts, text posts) or on any fetch/parse failure.
@@ -117,10 +152,7 @@ export const fetchPostMedia = async (
 
   let post: RedditPostData | undefined;
   try {
-    const res = await fetch(
-      `https://www.reddit.com/comments/${id}/.json?raw_json=1`,
-      { credentials: "include" },
-    );
+    const res = await fetchPostJson(id);
     const contentType = res.headers.get("content-type") ?? "";
     if (!res.ok || !contentType.includes("json")) {
       logger.warn(

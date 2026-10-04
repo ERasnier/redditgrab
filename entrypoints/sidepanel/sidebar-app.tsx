@@ -11,6 +11,7 @@ import {
   markDownloadedAsVisited as markDownloadedAsVisitedStorage,
   showDownloadedMarkers as showDownloadedMarkersStorage,
   forceDownloadProcessed as forceDownloadProcessedStorage,
+  requestDelaySeconds as requestDelaySecondsStorage,
   useDateRange as useDateRangeStorage,
   dateRangeStart as dateRangeStartStorage,
   dateRangeEnd as dateRangeEndStorage,
@@ -85,6 +86,10 @@ const debouncedSaveForceDownloadProcessed = debounce(async (value: boolean) => {
   await forceDownloadProcessedStorage.setValue(value);
 }, 500);
 
+const debouncedSaveRequestDelaySeconds = debounce(async (value: number) => {
+  await requestDelaySecondsStorage.setValue(value);
+}, 500);
+
 const debouncedSaveUseDateRange = debounce(async (value: boolean) => {
   await useDateRangeStorage.setValue(value);
 }, 500);
@@ -117,6 +122,7 @@ function SidebarApp() {
       markDownloadedAsVisited: false,
       showDownloadedMarkers: false,
       forceDownloadProcessed: false,
+      requestDelaySeconds: 1,
       useDateRange: false,
       dateRangeStart: undefined,
       dateRangeEnd: undefined,
@@ -143,6 +149,7 @@ function SidebarApp() {
         markDownloadedAsVisited,
         showDownloadedMarkers,
         forceDownloadProcessed,
+        requestDelaySeconds,
         useDateRange,
         dateRangeStart,
         dateRangeEnd,
@@ -156,6 +163,7 @@ function SidebarApp() {
         markDownloadedAsVisitedStorage.getValue(),
         showDownloadedMarkersStorage.getValue(),
         forceDownloadProcessedStorage.getValue(),
+        requestDelaySecondsStorage.getValue(),
         useDateRangeStorage.getValue(),
         dateRangeStartStorage.getValue(),
         dateRangeEndStorage.getValue(),
@@ -176,6 +184,7 @@ function SidebarApp() {
         markDownloadedAsVisited: markDownloadedAsVisited || false,
         showDownloadedMarkers: showDownloadedMarkers || false,
         forceDownloadProcessed: forceDownloadProcessed || false,
+        requestDelaySeconds: requestDelaySeconds ?? 1,
         useDateRange: useDateRange || false,
         dateRangeStart: dateRangeStart ? parseInt(dateRangeStart) : undefined,
         dateRangeEnd: dateRangeEnd ? parseInt(dateRangeEnd) : undefined,
@@ -223,6 +232,15 @@ function SidebarApp() {
             debouncedSaveForceDownloadProcessed(
               value.forceDownloadProcessed || false,
             );
+            break;
+          case "requestDelaySeconds":
+            if (
+              typeof value.requestDelaySeconds === "number" &&
+              value.requestDelaySeconds >= 0 &&
+              value.requestDelaySeconds <= 60
+            ) {
+              debouncedSaveRequestDelaySeconds(value.requestDelaySeconds);
+            }
             break;
           case "useDateRange":
             debouncedSaveUseDateRange(value.useDateRange || false);
@@ -524,9 +542,14 @@ function SidebarApp() {
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
             }
 
-            // Small delay between downloads to avoid overwhelming the system
+            // Pause between downloads so Reddit doesn't rate limit the page
             if (i < filteredMediaUrls.length - 1) {
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+              const delaySeconds = form.getValues("requestDelaySeconds");
+              const delayMs =
+                Number.isFinite(delaySeconds) && delaySeconds >= 0
+                  ? delaySeconds * 1000
+                  : 1000;
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
             }
           } catch (error) {
             console.error(`Failed to download item ${i + 1}:`, error);
@@ -979,6 +1002,49 @@ function SidebarApp() {
                     </Tooltip>
                   </TooltipProvider>
                 </div>
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="requestDelaySeconds"
+            render={({ field }) => (
+              <FormItem>
+                <div className="flex items-center gap-1.5">
+                  <FormLabel>Delay between requests (seconds)</FormLabel>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="inline-flex text-gray-500 dark:text-gray-400 cursor-help">
+                          <Icon icon="lucide:info" className="size-3.5" />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">
+                          Waits this long between mass downloads and between
+                          post lookups on search pages. Raise it if Reddit
+                          stops loading posts partway through.
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+                <FormControl>
+                  <input
+                    type="number"
+                    min={0}
+                    max={60}
+                    step={0.5}
+                    name={field.name}
+                    ref={field.ref}
+                    onBlur={field.onBlur}
+                    value={Number.isFinite(field.value) ? field.value : ""}
+                    onChange={(e) => field.onChange(e.target.valueAsNumber)}
+                    className="w-24 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded focus:ring-2 focus:ring-orange-500 focus:border-transparent transition-colors bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                  />
+                </FormControl>
+                <FormMessage />
               </FormItem>
             )}
           />
