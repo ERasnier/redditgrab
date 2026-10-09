@@ -1,6 +1,11 @@
 import { MESSAGE_TARGET, OFFSCREEN_KEYS } from "@/utils/constants";
 
-export type MediaContentType = "video" | "single-image" | "multiple-images";
+// "text" is a post with no downloadable media; only its archive is saved.
+export type MediaContentType =
+  | "video"
+  | "single-image"
+  | "multiple-images"
+  | "text";
 
 export type DownloadVideoOptions = {
   url: string;
@@ -8,6 +13,7 @@ export type DownloadVideoOptions = {
   subredditName: string;
   addTitleToVideo: boolean;
   postTitle: string;
+  postAuthor?: string;
   filenamePattern: string;
   offscreen?: boolean;
 };
@@ -19,6 +25,7 @@ export type DownloadImageOptions = {
   useGalleryFolders?: boolean;
   addTitleToImages?: boolean;
   postTitle?: string;
+  postAuthor?: string;
   filenamePattern: string;
   offscreen?: boolean;
 };

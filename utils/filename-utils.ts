@@ -6,6 +6,7 @@ export interface FilenameData {
   filename: string;
   extension: string;
   title?: string;
+  user?: string;
 }
 
 /**
@@ -24,9 +25,11 @@ export function sanitizeForFilename(
 
 export function generateFilename(pattern: string, data: FilenameData): string {
   const safeTitle = sanitizeForFilename(data.title) || "untitled";
+  const safeUser = sanitizeForFilename(data.user) || "unknown-user";
   return (
     pattern
       .replace(/{subreddit}/g, data.subreddit)
+      .replace(/{user}/g, safeUser)
       .replace(/{timestamp}/g, data.timestamp)
       .replace(/{title}/g, safeTitle)
       .replace(/{filename}/g, data.filename) +

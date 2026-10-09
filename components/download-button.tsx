@@ -6,6 +6,7 @@ import {
   addTitleToImages as addTitleToImagesStorage,
   addTitleToVideos as addTitleToVideosStorage,
   markDownloadedAsVisited as markDownloadedAsVisitedStorage,
+  savePostArchive as savePostArchiveStorage,
   addProcessedPostId,
 } from "@/utils/storage";
 import { getPostIdentifier } from "@/utils/post-identifier";
@@ -13,7 +14,11 @@ import { markPostAsVisited } from "@/utils/mark-visited";
 import { sendMessage } from "webext-bridge/content-script";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@iconify/react";
-import { getPostTitle, processFolderDestination } from "@/utils/post-utils";
+import {
+  getPostAuthor,
+  getPostTitle,
+  processFolderDestination,
+} from "@/utils/post-utils";
 
 const DownloadButton = ({
   mediaContainer,
@@ -42,6 +47,7 @@ const DownloadButton = ({
       const useGalleryFolders = await useGalleryFoldersStorage.getValue();
       const addTitleToImages = await addTitleToImagesStorage.getValue();
       const addTitleToVideos = await addTitleToVideosStorage.getValue();
+      const savePostArchive = await savePostArchiveStorage.getValue();
 
       // Process folder destination with variable substitution
       const postElement = mediaContainer.closest("shreddit-post");
@@ -50,13 +56,14 @@ const DownloadButton = ({
       );
       // Get post title if needed
       const postTitle = postElement ? getPostTitle(postElement) : undefined;
+      const postAuthor = postElement ? getPostAuthor(postElement) : undefined;
 
       const finalFolderDestination = processFolderDestination(
         latestFolderConfig,
         postElement,
         subredditName,
         undefined,
-        undefined,
+        postAuthor,
         postTitle,
       );
 
@@ -73,6 +80,9 @@ const DownloadButton = ({
           addTitleToImages,
           addTitleToVideos,
           postTitle,
+          postAuthor,
+          postId: postElement ? getPostIdentifier(postElement) : undefined,
+          savePostArchive,
         },
         "background",
       );

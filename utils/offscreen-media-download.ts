@@ -4,6 +4,7 @@ import {
   isBackgroundMessage,
 } from "@/types";
 import { OFFSCREEN_DOCUMENT_PATH } from "@/utils/constants";
+import { downloadAndWait } from "@/utils/blob-utils";
 
 declare const self: ServiceWorkerGlobalScope;
 
@@ -40,27 +41,65 @@ export async function createOffscreenDocument() {
   });
 }
 
+// Offscreen jobs in flight. When it drops to zero the document is closed,
+// releasing every blob and ffmpeg instance it held; otherwise that memory
+// stayed allocated until the extension was reloaded.
+let activeOffscreenJobs = 0;
+let closingOffscreenDocument: Promise<void> | null = null;
+
+function closeOffscreenDocumentWhenIdle() {
+  if (activeOffscreenJobs > 0 || closingOffscreenDocument) return;
+  closingOffscreenDocument = (async () => {
+    try {
+      if (await hasOffscreenDocument()) {
+        await browser.offscreen.closeDocument();
+      }
+    } catch (error) {
+      logger.warn("Failed to close offscreen document:", error);
+    }
+  })().finally(() => {
+    closingOffscreenDocument = null;
+  });
+}
+
+async function runOffscreenJob(
+  type: (typeof OFFSCREEN_KEYS)[keyof typeof OFFSCREEN_KEYS],
+  options:
+    | Omit<DownloadVideoOptions, "offscreen">
+    | Omit<DownloadImageOptions, "offscreen">
+) {
+  activeOffscreenJobs++;
+  try {
+    // Never send work to a document that is in the middle of closing.
+    await closingOffscreenDocument;
+    await createOffscreenDocument();
+
+    const downloadId = crypto.randomUUID();
+    const downloadComplete = new Promise<void>((resolve, reject) => {
+      pendingDownloads.set(downloadId, { resolve, reject });
+    });
+
+    await browser.runtime.sendMessage({
+      type,
+      target: MESSAGE_TARGET.OFFSCREEN,
+      data: options,
+      downloadId,
+    });
+
+    await downloadComplete;
+  } finally {
+    activeOffscreenJobs--;
+    closeOffscreenDocumentWhenIdle();
+  }
+}
+
 export const offscreenDownloadVideo = async (
   options: Omit<DownloadVideoOptions, "offscreen">
 ) => {
   if (!browser.offscreen) {
     return;
   }
-  await createOffscreenDocument();
-
-  const downloadId = crypto.randomUUID();
-  const downloadComplete = new Promise<void>((resolve, reject) => {
-    pendingDownloads.set(downloadId, { resolve, reject });
-  });
-
-  await browser.runtime.sendMessage({
-    type: OFFSCREEN_KEYS.DOWNLOAD_VIDEO,
-    target: MESSAGE_TARGET.OFFSCREEN,
-    data: options,
-    downloadId,
-  });
-
-  await downloadComplete;
+  await runOffscreenJob(OFFSCREEN_KEYS.DOWNLOAD_VIDEO, options);
 };
 
 export const offscreenDownloadGalleryImages = async (
@@ -69,22 +108,7 @@ export const offscreenDownloadGalleryImages = async (
   if (!browser.offscreen) {
     return;
   }
-
-  await createOffscreenDocument();
-
-  const downloadId = crypto.randomUUID();
-  const downloadComplete = new Promise<void>((resolve, reject) => {
-    pendingDownloads.set(downloadId, { resolve, reject });
-  });
-
-  await browser.runtime.sendMessage({
-    type: OFFSCREEN_KEYS.DOWNLOAD_IMAGE,
-    target: MESSAGE_TARGET.OFFSCREEN,
-    data: options,
-    downloadId,
-  });
-
-  await downloadComplete;
+  await runOffscreenJob(OFFSCREEN_KEYS.DOWNLOAD_IMAGE, options);
 };
 
 export async function handleOffscreenMessages(message: any) {
@@ -101,11 +125,9 @@ export async function handleOffscreenMessages(message: any) {
         if (!video?.url) {
           throw new Error(video?.error || "No video file produced");
         }
-        await browser.downloads.download({
-          url: video.url,
-          filename: video.filename,
-          saveAs: false,
-        });
+        // Wait for the file to be written: the offscreen document (and the
+        // blob behind this URL) is closed as soon as the job resolves.
+        await downloadAndWait(video.url, video.filename);
         break;
       }
       case OFFSCREEN_KEYS.DOWNLOAD_IMAGE: {
@@ -116,13 +138,7 @@ export async function handleOffscreenMessages(message: any) {
           throw new Error(items?.error || "No image files produced");
         }
         await Promise.all(
-          items.map((item) =>
-            browser.downloads.download({
-              url: item.url,
-              filename: item.filename,
-              saveAs: false,
-            })
-          )
+          items.map((item) => downloadAndWait(item.url, item.filename))
         );
         break;
       }

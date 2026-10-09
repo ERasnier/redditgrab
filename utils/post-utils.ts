@@ -30,15 +30,19 @@ export const getPostTitle = (post: Element): string => {
 /**
  * Extract the post author/username from a Reddit post element
  * @param post - The Reddit post element (shreddit-post)
- * @returns The post author username or empty string if not found
+ * @returns The post author username or unknown-user if not found
  */
 export const getPostAuthor = (post: Element): string => {
-  // Use the same selector as post-identifier.ts for consistency
-  const authorElement = post.querySelector('a[href*="/user/"]');
-  const authorText = authorElement?.textContent?.trim() || "u/unknown-user";
+  // shreddit-post carries the username as an attribute. Elements without it
+  // (e.g. search result rows) fall back to the profile link in the markup.
+  const fromAttribute = post.getAttribute("author");
+  if (fromAttribute) return fromAttribute;
 
-  // Remove "u/" prefix if present
-  return authorText.startsWith("u/") ? authorText.slice(2) : authorText;
+  const authorText = post
+    .querySelector('a[href*="/user/"]')
+    ?.textContent?.trim()
+    .replace(/^u\//, "");
+  return authorText || "unknown-user";
 };
 
 /**

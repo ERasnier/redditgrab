@@ -41,6 +41,10 @@ export interface DownloadRequestMessage {
   addTitleToImages: boolean;
   addTitleToVideos: boolean;
   postTitle?: string;
+  postAuthor?: string;
+  /** Reddit thing id (t3_...), needed to save the post archive. */
+  postId?: string;
+  savePostArchive?: boolean;
 }
 
 export interface DownloadRequestResponse {

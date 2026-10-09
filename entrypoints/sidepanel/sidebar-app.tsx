@@ -11,6 +11,8 @@ import {
   markDownloadedAsVisited as markDownloadedAsVisitedStorage,
   showDownloadedMarkers as showDownloadedMarkersStorage,
   forceDownloadProcessed as forceDownloadProcessedStorage,
+  requestDelaySeconds as requestDelaySecondsStorage,
+  savePostArchive as savePostArchiveStorage,
   useDateRange as useDateRangeStorage,
   dateRangeStart as dateRangeStartStorage,
   dateRangeEnd as dateRangeEndStorage,
@@ -85,6 +87,14 @@ const debouncedSaveForceDownloadProcessed = debounce(async (value: boolean) => {
   await forceDownloadProcessedStorage.setValue(value);
 }, 500);
 
+const debouncedSaveRequestDelaySeconds = debounce(async (value: number) => {
+  await requestDelaySecondsStorage.setValue(value);
+}, 500);
+
+const debouncedSaveSavePostArchive = debounce(async (value: boolean) => {
+  await savePostArchiveStorage.setValue(value);
+}, 500);
+
 const debouncedSaveUseDateRange = debounce(async (value: boolean) => {
   await useDateRangeStorage.setValue(value);
 }, 500);
@@ -117,6 +127,8 @@ function SidebarApp() {
       markDownloadedAsVisited: false,
       showDownloadedMarkers: false,
       forceDownloadProcessed: false,
+      requestDelaySeconds: 1,
+      savePostArchive: false,
       useDateRange: false,
       dateRangeStart: undefined,
       dateRangeEnd: undefined,
@@ -143,6 +155,8 @@ function SidebarApp() {
         markDownloadedAsVisited,
         showDownloadedMarkers,
         forceDownloadProcessed,
+        requestDelaySeconds,
+        savePostArchive,
         useDateRange,
         dateRangeStart,
         dateRangeEnd,
@@ -156,6 +170,8 @@ function SidebarApp() {
         markDownloadedAsVisitedStorage.getValue(),
         showDownloadedMarkersStorage.getValue(),
         forceDownloadProcessedStorage.getValue(),
+        requestDelaySecondsStorage.getValue(),
+        savePostArchiveStorage.getValue(),
         useDateRangeStorage.getValue(),
         dateRangeStartStorage.getValue(),
         dateRangeEndStorage.getValue(),
@@ -176,6 +192,8 @@ function SidebarApp() {
         markDownloadedAsVisited: markDownloadedAsVisited || false,
         showDownloadedMarkers: showDownloadedMarkers || false,
         forceDownloadProcessed: forceDownloadProcessed || false,
+        requestDelaySeconds: requestDelaySeconds ?? 1,
+        savePostArchive: savePostArchive || false,
         useDateRange: useDateRange || false,
         dateRangeStart: dateRangeStart ? parseInt(dateRangeStart) : undefined,
         dateRangeEnd: dateRangeEnd ? parseInt(dateRangeEnd) : undefined,
@@ -223,6 +241,18 @@ function SidebarApp() {
             debouncedSaveForceDownloadProcessed(
               value.forceDownloadProcessed || false,
             );
+            break;
+          case "requestDelaySeconds":
+            if (
+              typeof value.requestDelaySeconds === "number" &&
+              value.requestDelaySeconds >= 0 &&
+              value.requestDelaySeconds <= 60
+            ) {
+              debouncedSaveRequestDelaySeconds(value.requestDelaySeconds);
+            }
+            break;
+          case "savePostArchive":
+            debouncedSaveSavePostArchive(value.savePostArchive || false);
             break;
           case "useDateRange":
             debouncedSaveUseDateRange(value.useDateRange || false);
@@ -490,6 +520,9 @@ function SidebarApp() {
                 addTitleToImages: form.getValues("addTitleToImages"),
                 addTitleToVideos: form.getValues("addTitleToVideos"),
                 postTitle: mediaItem.postTitle,
+                postAuthor: mediaItem.postAuthor,
+                postId: mediaItem.mediaPostId,
+                savePostArchive: form.getValues("savePostArchive"),
               },
               "background",
             );
@@ -523,9 +556,14 @@ function SidebarApp() {
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
             }
 
-            // Small delay between downloads to avoid overwhelming the system
+            // Pause between downloads so Reddit doesn't rate limit the page
             if (i < filteredMediaUrls.length - 1) {
-              await new Promise((resolve) => setTimeout(resolve, 1000));
+              const delaySeconds = form.getValues("requestDelaySeconds");
+              const delayMs =
+                Number.isFinite(delaySeconds) && delaySeconds >= 0
+                  ? delaySeconds * 1000
+                  : 1000;
+              await new Promise((resolve) => setTimeout(resolve, delayMs));
             }
           } catch (error) {
             console.error(`Failed to download item ${i + 1}:`, error);
@@ -793,7 +831,7 @@ function SidebarApp() {
                 </FormControl>
                 <FormDescription>
                   Available: {"{subreddit}"}, {"{timestamp}"}, {"{title}"},{" "}
-                  {"{filename}"}
+                  {"{user}"}, {"{filename}"}
                 </FormDescription>
                 <FormMessage />
               </FormItem>
@@ -978,6 +1016,84 @@ function SidebarApp() {
                     </Tooltip>
                   </TooltipProvider>
                 </div>
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="savePostArchive"
+            render={({ field }) => (
+              <FormItem className="flex flex-row items-start space-x-3 space-y-0">
+                <FormControl>
+                  <Checkbox
+                    checked={field.value}
+                    onCheckedChange={field.onChange}
+                  />
+                </FormControl>
+                <div className="space-y-1 leading-none flex items-center gap-1.5">
+                  <FormLabel>Save post text &amp; comments</FormLabel>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="inline-flex text-gray-500 dark:text-gray-400 cursor-help">
+                          <Icon icon="lucide:info" className="size-3.5" />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">
+                          Saves each post as an HTML page (title, text, images
+                          and comments, no ads or sidebars) next to its media.
+                          Print it to get a PDF. Mass download on feeds and old
+                          Reddit also saves text-only posts.
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="requestDelaySeconds"
+            render={({ field }) => (
+              <FormItem>
+                <div className="flex items-center gap-1.5">
+                  <FormLabel>Delay between requests (seconds)</FormLabel>
+                  <TooltipProvider>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <span className="inline-flex text-gray-500 dark:text-gray-400 cursor-help">
+                          <Icon icon="lucide:info" className="size-3.5" />
+                        </span>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        <p className="text-xs">
+                          Waits this long between mass downloads and between
+                          post lookups on search pages. Raise it if Reddit
+                          stops loading posts partway through.
+                        </p>
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+                <FormControl>
+                  <input
+                    type="number"
+                    min={0}
+                    max={60}
+                    step={0.5}
+                    name={field.name}
+                    ref={field.ref}
+                    onBlur={field.onBlur}
+                    value={Number.isFinite(field.value) ? field.value : ""}
+                    onChange={(e) => field.onChange(e.target.valueAsNumber)}
+                    className="w-24 px-2 py-1.5 text-sm border border-gray-300 dark:border-gray-600 rounded focus:ring-2 focus:ring-orange-500 focus:border-transparent transition-colors bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                  />
+                </FormControl>
+                <FormMessage />
               </FormItem>
             )}
           />

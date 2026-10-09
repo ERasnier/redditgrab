@@ -1,6 +1,10 @@
 import { addTextToImage, addTextToVideo } from "./text-overlays";
 import { logger } from "./logger";
-import { createBlobUrl } from "./blob-utils";
+import {
+  createBlobUrl,
+  downloadAndRelease,
+  revokeIfObjectUrl,
+} from "./blob-utils";
 import { DownloadImageOptions, DownloadVideoOptions } from "@/types";
 import { compact } from "es-toolkit";
 
@@ -99,26 +103,118 @@ export async function getGalleryImageUrls(mediaElement: Element) {
   return urls;
 }
 
-async function getRemoteFile(url: string) {
-  const response = await fetch(url, { mode: "no-cors" });
-  const contentType = response.headers.get("content-type");
-
-  let extension = "jpg";
-  if (contentType) {
-    if (contentType.includes("png")) extension = "png";
-    if (contentType.includes("gif")) extension = "gif";
-    if (contentType.includes("mp4")) extension = "mp4";
+/**
+ * Reddit serves resized copies of images from preview.redd.it, named either
+ * `<id>.<ext>` or `<title-slug>-v0-<id>.<ext>`. The untouched original lives at
+ * i.redd.it/<id>.<ext>. Returns null for anything that isn't a preview URL.
+ */
+export function toFullResolutionUrl(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
   }
+  if (parsed.hostname !== "preview.redd.it") return null;
 
-  // fallback: try to parse extension from URL
-  const urlPath = new URL(url).pathname;
-  const match = urlPath.match(/\.([a-z0-9]+)(?:$|\?)/i);
-  if (match) extension = match[1].toLowerCase();
+  const file = parsed.pathname.split("/").pop() ?? "";
+  const match = file.match(/(?:^|-)([a-z0-9]+)\.(jpe?g|png|gif|webp)$/i);
+  if (!match) return null;
+  return `https://i.redd.it/${match[1]}.${match[2].toLowerCase()}`;
+}
 
-  return {
-    extension,
-    blob: await response.blob(),
-  };
+/**
+ * Identify the real format from the file's leading bytes. Reddit often serves
+ * webp (`auto=webp`) from URLs ending in .jpg/.png, so neither the URL nor a
+ * missing content-type can be trusted for the saved file's extension.
+ */
+function sniffMediaType(
+  bytes: Uint8Array,
+): { extension: string; mime: string } | null {
+  const ascii = (start: number, end: number) =>
+    String.fromCharCode(...bytes.subarray(start, end));
+
+  if (bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return { extension: "jpg", mime: "image/jpeg" };
+  }
+  if (bytes[0] === 0x89 && ascii(1, 4) === "PNG") {
+    return { extension: "png", mime: "image/png" };
+  }
+  if (ascii(0, 4) === "GIF8") {
+    return { extension: "gif", mime: "image/gif" };
+  }
+  if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") {
+    return { extension: "webp", mime: "image/webp" };
+  }
+  if (ascii(4, 8) === "ftyp") {
+    const brand = ascii(8, 12);
+    if (brand === "avif" || brand === "avis") {
+      return { extension: "avif", mime: "image/avif" };
+    }
+    return { extension: "mp4", mime: "video/mp4" };
+  }
+  return null;
+}
+
+function extensionFromContentType(contentType: string | null): string | null {
+  if (!contentType) return null;
+  if (contentType.includes("webp")) return "webp";
+  if (contentType.includes("avif")) return "avif";
+  if (contentType.includes("png")) return "png";
+  if (contentType.includes("gif")) return "gif";
+  if (contentType.includes("mp4")) return "mp4";
+  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
+  return null;
+}
+
+async function fetchMediaBlob(url: string) {
+  const response = await fetch(url, { mode: "no-cors" });
+  if (!response.ok && response.type !== "opaque") {
+    throw new Error(`Failed to fetch ${url}: ${response.status}`);
+  }
+  const blob = await response.blob();
+  if (blob.size === 0) {
+    throw new Error(`Empty response for ${url}`);
+  }
+  return { blob, contentType: response.headers.get("content-type") };
+}
+
+async function getRemoteFile(url: string) {
+  // Prefer the full-resolution original; keep the preview as a fallback in
+  // case the original isn't reachable.
+  let sourceUrl = url;
+  let fetched: Awaited<ReturnType<typeof fetchMediaBlob>> | undefined;
+  const fullResolutionUrl = toFullResolutionUrl(url);
+  if (fullResolutionUrl) {
+    try {
+      fetched = await fetchMediaBlob(fullResolutionUrl);
+      sourceUrl = fullResolutionUrl;
+    } catch (error) {
+      logger.warn("Full-resolution image unavailable, using preview:", error);
+    }
+  }
+  fetched ??= await fetchMediaBlob(url);
+
+  const header = new Uint8Array(await fetched.blob.slice(0, 16).arrayBuffer());
+  const sniffed = sniffMediaType(header);
+  const urlExtension = new URL(sourceUrl).pathname
+    .match(/\.([a-z0-9]+)$/i)?.[1]
+    ?.toLowerCase();
+
+  const extension =
+    sniffed?.extension ??
+    extensionFromContentType(fetched.contentType) ??
+    urlExtension ??
+    "jpg";
+
+  // Give the blob the MIME type matching its bytes so the browser doesn't
+  // second-guess the extension when saving.
+  const blob =
+    sniffed && fetched.blob.type !== sniffed.mime
+      ? new Blob([fetched.blob], { type: sniffed.mime })
+      : fetched.blob;
+
+  return { extension, blob, sourceUrl };
 }
 
 export async function downloadGalleryImages(options: DownloadImageOptions) {
@@ -130,6 +226,7 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
     addTitleToImages = false,
     filenamePattern = "{subreddit}_{timestamp}_{filename}",
     postTitle,
+    postAuthor,
     offscreen = false,
   } = options;
 
@@ -148,12 +245,17 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
       ? `${folderDestination}/${subredditName}${galleryFolderSuffix}`
       : folderDestination;
 
-  const results = await Promise.all(
+  const results = await Promise.allSettled(
     urls.map(async (url, index) => {
-      let { extension, blob } = await getRemoteFile(url);
+      let { extension, blob, sourceUrl } = await getRemoteFile(url);
 
       // Apply text overlay if enabled and we have a title
-      if (addTitleToImages && postTitle && extension !== "gif") {
+      if (
+        addTitleToImages &&
+        postTitle &&
+        extension !== "gif" &&
+        extension !== "mp4"
+      ) {
         try {
           logger.log("Adding text overlay to image:", {
             postTitle,
@@ -177,9 +279,10 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
       const filename = generateFilename(pattern, {
         subreddit: subredditName,
         timestamp: getCurrentTimestamp(),
-        filename: extractFilenameFromUrl(url),
+        filename: extractFilenameFromUrl(sourceUrl),
         extension,
         title: postTitle,
+        user: postAuthor,
       });
 
       // For galleries with folders, add index to filename to avoid conflicts
@@ -201,16 +304,28 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
           filename: outputPath,
         };
       }
-      await browser.downloads.download({
-        url: dataUrl,
-        filename: outputPath,
-        saveAs: false,
-      });
+      await downloadAndRelease(dataUrl, outputPath);
     }),
   );
 
+  // One broken image shouldn't throw away the rest of the gallery; only fail
+  // the post when nothing could be saved.
+  const failures = results.filter(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  for (const failure of failures) {
+    logger.error("Gallery image download failed:", failure.reason);
+  }
+  if (failures.length === results.length) {
+    throw failures[0]?.reason ?? new Error("No images to download");
+  }
+
   if (offscreen) {
-    return compact(results);
+    return compact(
+      results.map((result) =>
+        result.status === "fulfilled" ? result.value : undefined,
+      ),
+    );
   }
 }
 
@@ -221,6 +336,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
     subredditName = "unknown",
     addTitleToVideo = false,
     postTitle,
+    postAuthor,
     filenamePattern,
     offscreen = false,
   } = options;
@@ -260,10 +376,12 @@ export async function downloadVideo(options: DownloadVideoOptions) {
       filename: extractFilenameFromUrl(url),
       extension,
       title: postTitle,
+      user: postAuthor,
     });
     const outputPath = sanitizeDownloadPath(`${folderDestination}/${filename}`);
 
     // If text overlay is enabled and we have a title, process the video
+    let downloadUrl = url;
     if (addTitleToVideo && postTitle) {
       try {
         logger.log("Adding text overlay to video:", postTitle);
@@ -273,49 +391,24 @@ export async function downloadVideo(options: DownloadVideoOptions) {
 
         const processedVideoBlob = await addTextToVideo(videoBlob, postTitle);
 
-        const dataUrl = await createBlobUrl(processedVideoBlob);
-
-        if (offscreen) {
-          return {
-            url: dataUrl,
-            filename: outputPath,
-          };
-        }
-        await browser.downloads.download({
-          url: dataUrl,
-          filename: outputPath,
-          saveAs: false,
-        });
+        downloadUrl = await createBlobUrl(processedVideoBlob);
+        // The unprocessed video is no longer needed; free it now.
+        revokeIfObjectUrl(url);
       } catch (error) {
         logger.error(
           "Failed to add text to video, downloading original:",
           error,
         );
-        if (offscreen) {
-          return {
-            url,
-            filename: outputPath,
-          };
-        }
-        await browser.downloads.download({
-          url,
-          filename: outputPath,
-          saveAs: false,
-        });
       }
-    } else {
-      if (offscreen) {
-        return {
-          url,
-          filename: outputPath,
-        };
-      }
-      await browser.downloads.download({
-        url,
-        filename: outputPath,
-        saveAs: false,
-      });
     }
+
+    if (offscreen) {
+      return {
+        url: downloadUrl,
+        filename: outputPath,
+      };
+    }
+    await downloadAndRelease(downloadUrl, outputPath);
   } catch (err) {
     // Rethrow so the failure propagates: swallowing it made Firefox report a
     // silent success and the failed post was never retried/skipped.

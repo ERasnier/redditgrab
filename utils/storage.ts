@@ -64,3 +64,15 @@ export const forceDownloadProcessed = storage.defineItem(
   "local:forceDownloadProcessed",
   { fallback: false },
 );
+
+// Pause between mass-download requests, in seconds. Reddit stops serving posts
+// when requests arrive too quickly, so users who hit that limit can raise it.
+export const requestDelaySeconds = storage.defineItem(
+  "local:requestDelaySeconds",
+  { fallback: 1 },
+);
+
+// Also save each downloaded post's text and comments as a standalone HTML page.
+export const savePostArchive = storage.defineItem("local:savePostArchive", {
+  fallback: false,
+});

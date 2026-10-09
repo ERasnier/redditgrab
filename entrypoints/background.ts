@@ -60,6 +60,31 @@ async function handleDownloadRequest(data: DownloadRequestMessage) {
 
   const folderDestination = data.folderDestination || "Reddit Downloads";
   const subredditName = data.subredditName || "unknown";
+  const pattern = await filenamePattern.getValue();
+
+  const archive = async () => {
+    if (!data.savePostArchive || !data.postId?.startsWith("t3_")) return;
+    await downloadPostArchive({
+      postId: data.postId,
+      folderDestination,
+      subredditName,
+      filenamePattern: pattern,
+      postTitle: data.postTitle,
+      postAuthor: data.postAuthor,
+    });
+  };
+
+  // Text posts have nothing else to save, so an archive failure is the
+  // request's failure. For media posts the media is what matters; a missing
+  // archive is only logged.
+  if (data.mediaContentType === "text") {
+    await archive();
+    return;
+  }
+  const archiveAlongsideMedia = () =>
+    archive().catch((error) => {
+      logger.error("Failed to save post archive:", error);
+    });
 
   if (
     data.mediaContentType === "multiple-images" ||
@@ -72,14 +97,16 @@ async function handleDownloadRequest(data: DownloadRequestMessage) {
       useGalleryFolders: data.useGalleryFolders,
       addTitleToImages: data.addTitleToImages,
       postTitle: data.postTitle,
-      filenamePattern: await filenamePattern.getValue(),
+      postAuthor: data.postAuthor,
+      filenamePattern: pattern,
     } as const satisfies Parameters<typeof downloadGalleryImages>[0];
 
     if (browser.offscreen) {
       await offscreenDownloadGalleryImages(downloadGalleryImagesOptions);
-      return;
+    } else {
+      await downloadGalleryImages(downloadGalleryImagesOptions);
     }
-    await downloadGalleryImages(downloadGalleryImagesOptions);
+    await archiveAlongsideMedia();
   }
 
   if (data.mediaContentType === "video") {
@@ -89,14 +116,15 @@ async function handleDownloadRequest(data: DownloadRequestMessage) {
       subredditName,
       addTitleToVideo: data.addTitleToVideos,
       postTitle: data.postTitle || "",
-      filenamePattern: await filenamePattern.getValue(),
+      postAuthor: data.postAuthor,
+      filenamePattern: pattern,
     } as const satisfies Parameters<typeof downloadVideo>[0];
 
     if (browser.offscreen) {
       await offscreenDownloadVideo(downloadVideoOptions);
-      return;
+    } else {
+      await downloadVideo(downloadVideoOptions);
     }
-
-    await downloadVideo(downloadVideoOptions);
+    await archiveAlongsideMedia();
   }
 }
