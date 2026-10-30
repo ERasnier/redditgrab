@@ -4,9 +4,13 @@ export const useScrapingProgress = () => {
   const [scrapingStatus, setScrapingStatus] = useState({
     isScraping: false,
     downloadedCount: 0,
+    failedCount: 0,
+    skippedCount: 0,
+    examinedCount: 0,
     totalPostsFound: 0,
     currentBatchCount: 0,
     currentPostId: null as string | null,
+    lastFailure: null as { postId: string; reason: string } | null,
     currentPostInfo: null as {
       index: number;
       type: string;
@@ -19,8 +23,12 @@ export const useScrapingProgress = () => {
       ...prev,
       isScraping: true,
       downloadedCount: 0,
+      failedCount: 0,
+      skippedCount: 0,
+      examinedCount: 0,
       totalPostsFound: 0,
       currentBatchCount: 0,
+      lastFailure: null,
       currentPostInfo: null,
     }));
   };
@@ -47,6 +55,24 @@ export const useScrapingProgress = () => {
     }));
   };
 
+  /** A download was attempted and did not land. */
+  const recordFailure = (postId: string, reason: string) => {
+    setScrapingStatus((prev) => ({
+      ...prev,
+      failedCount: prev.failedCount + 1,
+      lastFailure: { postId, reason },
+    }));
+  };
+
+  /** Posts the scan looked at but never turned into a download candidate. */
+  const addScanTotals = (skipped: number, examined: number) => {
+    setScrapingStatus((prev) => ({
+      ...prev,
+      skippedCount: prev.skippedCount + skipped,
+      examinedCount: prev.examinedCount + examined,
+    }));
+  };
+
   const setCurrentPostInfo = (
     postInfo: { index: number; type: string; subreddit: string } | null
   ) => {
@@ -64,5 +90,7 @@ export const useScrapingProgress = () => {
     incrementDownloadCount,
     addToTotalPostsFound,
     setCurrentPostInfo,
+    recordFailure,
+    addScanTotals,
   };
 };

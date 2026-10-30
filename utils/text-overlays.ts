@@ -14,6 +14,40 @@ export async function addTextToImage(
     const img = new Image();
     img.crossOrigin = "anonymous";
 
+    // Hoisted so cleanup can reach them. A 4000x3000 source means a 48MB RGBA
+    // backing store per canvas; left to the GC these pile up across a gallery.
+    let tempCanvas: HTMLCanvasElement | null = null;
+    let canvas: HTMLCanvasElement | null = null;
+    let objectUrl: string | null = null;
+    let cleanedUp = false;
+
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      if (objectUrl) {
+        try {
+          URL.revokeObjectURL(objectUrl);
+        } catch {}
+        objectUrl = null;
+      }
+      // Detach the decoded bitmap.
+      img.onload = null;
+      img.onerror = null;
+      img.src = "";
+      // Zeroing the dimensions frees the backing store now, rather than
+      // whenever the GC gets round to the detached canvas.
+      if (tempCanvas) {
+        tempCanvas.width = 0;
+        tempCanvas.height = 0;
+        tempCanvas = null;
+      }
+      if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
+        canvas = null;
+      }
+    };
+
     img.onload = () => {
       try {
         // Calculate font size based on image width (responsive text)
@@ -28,8 +62,9 @@ export async function addTextToImage(
         let currentLine = words[0];
 
         // Create temporary canvas to measure text
-        const tempCanvas = document.createElement("canvas");
-        const tempCtx = tempCanvas.getContext("2d")!;
+        const measureCanvas = document.createElement("canvas");
+        tempCanvas = measureCanvas;
+        const tempCtx = measureCanvas.getContext("2d")!;
         tempCtx.font = `bold ${fontSize}px Arial, sans-serif`;
 
         for (let i = 1; i < words.length; i++) {
@@ -48,14 +83,15 @@ export async function addTextToImage(
         const textAreaHeight = lines.length * lineHeight + padding * 2;
 
         // Create a canvas with extra height for text
-        const canvas = document.createElement("canvas");
-        canvas.width = img.width;
-        canvas.height = img.height + textAreaHeight;
-        const ctx = canvas.getContext("2d")!;
+        const outCanvas = document.createElement("canvas");
+        canvas = outCanvas;
+        outCanvas.width = img.width;
+        outCanvas.height = img.height + textAreaHeight;
+        const ctx = outCanvas.getContext("2d")!;
 
         // Fill the text area with white background
         ctx.fillStyle = "white";
-        ctx.fillRect(0, 0, canvas.width, textAreaHeight);
+        ctx.fillRect(0, 0, outCanvas.width, textAreaHeight);
 
         // Draw the original image below the text area
         ctx.drawImage(img, 0, textAreaHeight);
@@ -70,12 +106,15 @@ export async function addTextToImage(
 
         lines.forEach((line, index) => {
           const y = startY + index * lineHeight;
-          ctx.fillText(line, canvas.width / 2, y);
+          ctx.fillText(line, outCanvas.width / 2, y);
         });
 
         // Convert canvas to blob
-        canvas.toBlob(
+        outCanvas.toBlob(
           (blob) => {
+            // Release the source URL and both canvases before settling, so the
+            // caller never holds the originals alongside the result.
+            cleanup();
             if (blob) {
               resolve(blob);
             } else {
@@ -86,16 +125,18 @@ export async function addTextToImage(
           0.95
         );
       } catch (error) {
+        cleanup();
         reject(error);
       }
     };
 
     img.onerror = () => {
+      cleanup();
       reject(new Error("Failed to load image"));
     };
 
     // Create object URL from blob and set as image source
-    const objectUrl = URL.createObjectURL(imageBlob);
+    objectUrl = URL.createObjectURL(imageBlob);
     img.src = objectUrl;
   });
 }

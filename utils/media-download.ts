@@ -6,7 +6,6 @@ import {
   revokeIfObjectUrl,
 } from "./blob-utils";
 import { DownloadImageOptions, DownloadVideoOptions } from "@/types";
-import { compact } from "es-toolkit";
 
 export const getRedGifsUrl = (mediaElement: Element): string | null => {
   let embed: Element | null = null;
@@ -227,10 +226,13 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
     filenamePattern = "{subreddit}_{timestamp}_{filename}",
     postTitle,
     postAuthor,
-    offscreen = false,
   } = options;
 
   logger.log("Downloading gallery images:", urls);
+
+  if (urls.length === 0) {
+    throw new Error("No images to download");
+  }
 
   const pattern = filenamePattern;
 
@@ -245,8 +247,7 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
       ? `${folderDestination}/${subredditName}${galleryFolderSuffix}`
       : folderDestination;
 
-  const results = await Promise.allSettled(
-    urls.map(async (url, index) => {
+  const downloadOne = async (url: string, index: number) => {
       let { extension, blob, sourceUrl } = await getRemoteFile(url);
 
       // Apply text overlay if enabled and we have a title
@@ -291,41 +292,48 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
           ? `${index + 1}_${filename}`
           : filename;
 
-      // Convert blob to data URL for Chrome Manifest V3 compatibility
-      const dataUrl = await createBlobUrl(blob);
+      const objectUrl = await createBlobUrl(blob);
 
       const outputPath = sanitizeDownloadPath(
         `${finalFolderDestination}/${finalFilename}`,
       );
 
-      if (offscreen) {
-        return {
-          url: dataUrl,
-          filename: outputPath,
-        };
+      await downloadAndRelease(objectUrl, outputPath);
+  };
+
+  // Galleries used to fetch, composite and blob-URL every image at once. A
+  // 20-image gallery with title overlay on held 20 source blobs, 20 decoded
+  // bitmaps, 20 full-size canvases and 20 output blobs concurrently — close to
+  // a gigabyte for 4000px sources. Work through them a few at a time instead.
+  const CONCURRENCY = 3;
+  const failures: string[] = [];
+
+  for (let start = 0; start < urls.length; start += CONCURRENCY) {
+    const batch = urls.slice(start, start + CONCURRENCY);
+    const settled = await Promise.allSettled(
+      batch.map((url, i) => downloadOne(url, start + i)),
+    );
+    for (const result of settled) {
+      if (result.status === "rejected") {
+        const message =
+          result.reason instanceof Error
+            ? result.reason.message
+            : String(result.reason);
+        logger.error("Gallery image download failed:", message);
+        failures.push(message);
       }
-      await downloadAndRelease(dataUrl, outputPath);
-    }),
-  );
+    }
+  }
 
   // One broken image shouldn't throw away the rest of the gallery; only fail
   // the post when nothing could be saved.
-  const failures = results.filter(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
-  );
-  for (const failure of failures) {
-    logger.error("Gallery image download failed:", failure.reason);
-  }
-  if (failures.length === results.length) {
-    throw failures[0]?.reason ?? new Error("No images to download");
+  if (failures.length === urls.length) {
+    throw new Error(`all ${urls.length} image(s) failed: ${failures[0]}`);
   }
 
-  if (offscreen) {
-    return compact(
-      results.map((result) =>
-        result.status === "fulfilled" ? result.value : undefined,
-      ),
-    );
+  // A partial failure used to leave a 20-image post silently saved as 19.
+  if (failures.length > 0) {
+    return { partialFailures: failures, total: urls.length };
   }
 }
 
@@ -338,7 +346,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
     postTitle,
     postAuthor,
     filenamePattern,
-    offscreen = false,
+
   } = options;
 
   try {
@@ -402,12 +410,6 @@ export async function downloadVideo(options: DownloadVideoOptions) {
       }
     }
 
-    if (offscreen) {
-      return {
-        url: downloadUrl,
-        filename: outputPath,
-      };
-    }
     await downloadAndRelease(downloadUrl, outputPath);
   } catch (err) {
     // Rethrow so the failure propagates: swallowing it made Firefox report a
@@ -461,16 +463,37 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     }
 
     // For MP4 segments, we need to use binary concatenation, not the concat demuxer
-    // Step 1: Concatenate all segments into one file
-    let allSegments = new Uint8Array(0);
+    // Step 1: Concatenate all segments into one file.
+    //
+    // This used to grow one buffer by reallocating it per segment, which for n
+    // segments allocates and orphans ~n²/2 bytes — a 120-segment RedGIF churned
+    // through gigabytes of short-lived Uint8Arrays and held three or four
+    // copies of the video at peak. Read every segment once, allocate the
+    // destination once, and drop each chunk (and its MEMFS copy) as it is
+    // copied.
+    const chunks: (Uint8Array | null)[] = [];
+    let total = 0;
 
     for (const filename of segmentFiles) {
-      const segmentData = await ffmpeg.readFile(filename);
-      const newData = new Uint8Array(allSegments.length + segmentData.length);
-      newData.set(allSegments);
-      newData.set(segmentData as ArrayLike<number>, allSegments.length);
-      allSegments = newData;
+      const segmentData = (await ffmpeg.readFile(filename)) as Uint8Array;
+      chunks.push(segmentData);
+      total += segmentData.length;
     }
+
+    const allSegments = new Uint8Array(total);
+    let offset = 0;
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      if (!chunk) continue;
+      allSegments.set(chunk, offset);
+      offset += chunk.length;
+      chunks[i] = null;
+      try {
+        await ffmpeg.deleteFile(segmentFiles[i]);
+      } catch {}
+    }
+    chunks.length = 0;
 
     // Write the concatenated segments
     await ffmpeg.writeFile("concatenated.m4s", allSegments);
@@ -484,12 +507,8 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     // Read the final video file
     const finalVideo = await ffmpeg.readFile("live.mp4");
 
-    const filesToClean = [
-      ...segmentFiles,
-      "concatenated.m4s",
-      "live.mkv",
-      "live.mp4",
-    ];
+    // Segment files were already deleted during concatenation above.
+    const filesToClean = ["concatenated.m4s", "live.mkv", "live.mp4"];
     for (const file of filesToClean) {
       try {
         await ffmpeg.deleteFile(file);

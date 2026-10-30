@@ -12,11 +12,74 @@ export const processedPostIds = storage.defineItem("local:processedPostIds", {
   fallback: [] as string[],
 });
 
-/** Append a post id to the processed list (no-op if already present). */
-export const addProcessedPostId = async (id: string) => {
+/**
+ * Buffered writes to the processed list.
+ *
+ * Appending read the whole array, scanned it with `includes`, spread it into a
+ * new array and re-serialised — O(n) per download and O(n²) copying over a long
+ * run, with the full id list resident several times during each write. Ids are
+ * now buffered and flushed in batches, and the in-memory Set makes the
+ * duplicate check O(1).
+ */
+let pendingProcessedIds: string[] = [];
+let knownProcessedIds: Set<string> | null = null;
+let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+const PROCESSED_FLUSH_SIZE = 25;
+const PROCESSED_FLUSH_MS = 3000;
+
+/** Write any buffered ids to storage. Safe to call with nothing pending. */
+export const flushProcessedPostIds = async () => {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  if (pendingProcessedIds.length === 0) return;
+
+  const batch = pendingProcessedIds;
+  pendingProcessedIds = [];
+
   const current = await processedPostIds.getValue();
-  if (current.includes(id)) return;
-  await processedPostIds.setValue([...current, id]);
+  const merged = new Set(current);
+  for (const id of batch) merged.add(id);
+  if (merged.size !== current.length) {
+    await processedPostIds.setValue([...merged]);
+  }
+  knownProcessedIds = merged;
+};
+
+/** Queue a post id for the processed list (no-op if already present). */
+export const addProcessedPostId = async (id: string) => {
+  knownProcessedIds ??= new Set(await processedPostIds.getValue());
+  if (knownProcessedIds.has(id)) return;
+
+  knownProcessedIds.add(id);
+  pendingProcessedIds.push(id);
+
+  if (pendingProcessedIds.length >= PROCESSED_FLUSH_SIZE) {
+    await flushProcessedPostIds();
+    return;
+  }
+  flushTimer ??= setTimeout(() => {
+    flushTimer = null;
+    void flushProcessedPostIds();
+  }, PROCESSED_FLUSH_MS);
+};
+
+/** Add several ids at once (posts skipped by the media type filter). */
+export const addProcessedPostIds = async (ids: string[]) => {
+  for (const id of ids) await addProcessedPostId(id);
+  await flushProcessedPostIds();
+};
+
+/** Drop the cached view of the processed list, e.g. after clearing history. */
+export const resetProcessedPostIdCache = () => {
+  pendingProcessedIds = [];
+  knownProcessedIds = null;
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
 };
 
 export const useGalleryFolders = storage.defineItem("local:useGalleryFolders", {
@@ -75,4 +138,19 @@ export const requestDelaySeconds = storage.defineItem(
 // Also save each downloaded post's text and comments as a standalone HTML page.
 export const savePostArchive = storage.defineItem("local:savePostArchive", {
   fallback: false,
+});
+
+// Verbose console logging in production builds. Without this the logger is a
+// no-op outside dev builds, so an installed extension can't say why it skipped
+// a post.
+export const debugLogging = storage.defineItem("local:debugLogging", {
+  fallback: false,
+});
+
+// Wait for each download to actually finish before counting it a success.
+// `downloads.download()` resolves as soon as the download is queued, so without
+// this a 403, a disk error or an interrupted transfer is recorded as a success
+// and the post is marked processed with nothing on disk.
+export const verifyDownloads = storage.defineItem("local:verifyDownloads", {
+  fallback: true,
 });

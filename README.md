@@ -5,13 +5,10 @@
     <a href="https://addons.mozilla.org/en-US/firefox/addon/media-downloader-redditgrab" target="_blank">
       <img alt="mozilla" src="https://img.shields.io/badge/Firefox-FF7139?style=for-the-badge&logo=Firefox-Browser&logoColor=white" />
     </a>
-      <a href="https://chromewebstore.google.com/detail/redditgrab/pkjhbflcnjikmfiiojcagjidbjeimkbj?hl=en" target="_blank">
-      <img alt="chrome-extension" src="https://img.shields.io/badge/Google%20Chrome-4285F4?style=for-the-badge&logo=GoogleChrome&logoColor=white" />
-    </a>
   </p>
 </div>
 
-Browser extension for downloading images and videos from Reddit posts. Supports individual downloads and mass downloading with auto-scrolling.
+Firefox extension for downloading images and videos from Reddit posts. Supports individual downloads and mass downloading with auto-scrolling.
 
 ## Preview
 
@@ -61,10 +58,11 @@ Built with [WXT](https://wxt.dev/) and React.
 
 #### Commands
 
-- `pnpm dev` - Development server
-- `pnpm dev:firefox` - Firefox development
-- `pnpm zip` - Create distribution zip
-- `pnpm zip:firefox` - Create distribution zip for Firefox
+- `pnpm dev` - Development server (launches Firefox)
+- `pnpm build` - Build to `.output/firefox-mv2/`
+- `pnpm zip` - Create the distribution zip and a sources zip for AMO
+- `pnpm sign` - Sign for self-distribution (unlisted); needs AMO API credentials
+- `pnpm compile` - Typecheck
 
 ### Structure
 
@@ -72,7 +70,6 @@ Built with [WXT](https://wxt.dev/) and React.
 entrypoints/
 ├── background.ts          # Background script
 ├── download-button.content/ # Content script
-├── offscreen/             # Offscreen document (Chrome only)
 └── sidepanel/             # Sidebar UI
 components/                # React components
 utils/                     # Utilities
@@ -85,7 +82,6 @@ public/                    # Static assets
 - `activeTab` - Interact with Reddit
 - `storage` - Save settings
 - `tabs` - Query active tab
-- `offscreen` - Required for using ffmpeg.wasm in Chrome
 
 ## Privacy
 
@@ -94,3 +90,34 @@ No data collection:
 - No analytics
 - No marketing data
 - All media processing is local
+
+## Building and installing it yourself
+
+This fork is Firefox-only and is not published to a store.
+
+```bash
+pnpm install
+pnpm zip          # .output/redditgrab-<version>-firefox.zip
+```
+
+**Before signing, change the extension id** in `wxt.config.ts`
+(`browser_specific_settings.gecko.id`) — it still points at the upstream
+author's AMO listing.
+
+Then pick one:
+
+- **Temporary (no signing):** `about:debugging#/runtime/this-firefox` →
+  Load Temporary Add-on → `.output/firefox-mv2/manifest.json`. Gone on restart.
+- **Permanent, stock Firefox:** sign as unlisted/self-distributed via AMO
+  (`pnpm sign --api-key=… --api-secret=…`). Mozilla signs it; it never appears
+  in the store.
+- **Permanent, no signing:** run Firefox ESR, Developer Edition or Nightly and
+  set `xpinstall.signatures.required` to `false` in `about:config`.
+
+## Troubleshooting a download that didn't happen
+
+Turn on **Debug logging** in the sidebar, then run the mass download. Every post
+that is skipped or fails is logged with a reason code, and the sidebar offers
+**Save diagnostics report** — a text file listing each post, which page layout
+it came from (feed, search, or old.reddit), why it was skipped, and a permalink
+back to it.

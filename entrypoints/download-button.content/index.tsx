@@ -15,7 +15,7 @@ import {
   savePostArchive,
 } from "@/utils/storage";
 import { compact } from "es-toolkit";
-import { logger } from "@/utils/logger";
+import { logger, isDebugEnabled } from "@/utils/logger";
 import { parseISO, isValid } from "date-fns";
 import { markPostAsVisited } from "@/utils/mark-visited";
 import { getPostIdentifier, setPostIdentifier } from "@/utils/post-identifier";
@@ -31,6 +31,8 @@ import {
   getSearchThingId,
   findSearchRowByThingId,
   extractSearchResultMedia,
+  getSearchSubredditName,
+  getSearchPostTitle,
   type SearchResultMedia,
 } from "@/utils/search-scraping";
 import {
@@ -40,6 +42,76 @@ import {
   isOldRedditSelfPost,
   extractOldRedditPostMedia,
 } from "@/utils/old-reddit";
+import {
+  DiagnosticsCollector,
+  SKIP_REASON_TEXT,
+  isFailure,
+  permalinkForPostId,
+  type PostDiagnostic,
+  type SkipReason,
+} from "@/utils/diagnostics";
+
+/**
+ * One-line description of a DOM element for diagnostics — enough to tell a text
+ * post from a crosspost from a layout Reddit has renamed under us, without
+ * dumping the element itself into the log.
+ */
+const describeElement = (el: Element): string => {
+  const parts = [el.tagName.toLowerCase()];
+  for (const attr of ["post-type", "domain", "data-domain", "data-testid"]) {
+    const value = el.getAttribute(attr);
+    if (value) parts.push(`${attr}=${value}`);
+  }
+  const childTags = Array.from(el.children)
+    .slice(0, 6)
+    .map((child) => child.tagName.toLowerCase());
+  if (childTags.length) parts.push(`children=[${childTags.join(",")}]`);
+  return parts.join(" ");
+};
+
+/**
+ * Record a skip and echo it to the console.
+ *
+ * `enrich` supplies title/subreddit/permalink and is only invoked when the
+ * record will actually be stored — those are DOM queries, and running them for
+ * every already-downloaded post on every scan cycle is exactly the per-tick
+ * waste this pass removes.
+ */
+const recordSkip = (
+  collector: DiagnosticsCollector,
+  base: Pick<PostDiagnostic, "postId" | "reason"> &
+    Partial<Pick<PostDiagnostic, "detail" | "stage" | "source">>,
+  enrich?: () => Partial<
+    Pick<PostDiagnostic, "title" | "subreddit" | "permalink">
+  >,
+) => {
+  const extra = collector.willStore(base.reason) ? (enrich?.() ?? {}) : {};
+  collector.add({ ...base, ...extra });
+
+  const text = SKIP_REASON_TEXT[base.reason] ?? base.reason;
+  const line = `${isFailure(base.reason) ? "FAILED" : "skipped"} ${base.postId} — ${base.reason}: ${text}`;
+  if (isFailure(base.reason)) {
+    logger.error(line, base.detail ?? "");
+  } else {
+    logger.log(line, base.detail ?? "");
+  }
+};
+
+/** Always-visible summary of what a scan pass did and did not pick up. */
+const logScanSummary = (
+  label: string,
+  examined: number,
+  resolved: number,
+  collector: DiagnosticsCollector,
+) => {
+  const parts = Object.entries(collector.tally())
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${reason}=${count}`);
+  logger.always(
+    `${label}: examined ${examined}, queued ${resolved}, skipped ${collector.totalSkipped}` +
+      (parts.length ? ` (${parts.join(", ")})` : ""),
+  );
+};
 
 const scrollToLoadMore = (scrollUp: boolean) => {
   if (scrollUp) {
@@ -269,6 +341,26 @@ const removeDownloadedBadge = (el: HTMLElement) => {
   el.querySelector(`:scope > [${RG_DOWNLOADED_ATTR}]`)?.remove();
 };
 
+/**
+ * Cached view of the processed-post ids.
+ *
+ * `refreshDownloadedMarkers` runs off a 150ms-debounced scroll handler, and it
+ * used to deserialise the entire id array out of storage and build a fresh Set
+ * on every tick. With tens of thousands of stored ids that is megabytes of
+ * allocation per second during an auto-scroll. The Set is built once and
+ * invalidated by the storage watcher below.
+ */
+let processedIdCache: Set<string> | null = null;
+
+const getProcessedIdSet = async (): Promise<Set<string>> => {
+  processedIdCache ??= new Set(await processedPostIds.getValue());
+  return processedIdCache;
+};
+
+const invalidateProcessedIdCache = () => {
+  processedIdCache = null;
+};
+
 /** Add/remove the downloaded marker on every visible post/row to match storage. */
 const refreshDownloadedMarkers = async () => {
   // Off by default; when disabled, strip any badges and bail.
@@ -279,7 +371,7 @@ const refreshDownloadedMarkers = async () => {
     return;
   }
 
-  const ids = new Set(await processedPostIds.getValue());
+  const ids = await getProcessedIdSet();
   const onOldReddit = isOldReddit();
   const onSearch = !onOldReddit && isSearchResultsPage();
   const targets = onOldReddit
@@ -322,12 +414,15 @@ type ApiResolvedPostSource = {
   roots: Element[];
   getThingId: (root: Element) => string | null;
   extractMedia: (root: Element) => Promise<SearchResultMedia | null>;
+  /** Title/subreddit for diagnostics; only called when a record is stored. */
+  describe?: (root: Element) => { title?: string; subreddit?: string };
 };
 
 const scanApiResolvedPosts = async (
-  { label, roots, getThingId, extractMedia }: ApiResolvedPostSource,
+  { label, roots, getThingId, extractMedia, describe }: ApiResolvedPostSource,
   skipPostIds: string[] = [],
 ) => {
+  const diagnostics = new DiagnosticsCollector(isDebugEnabled());
   logger.log(`${label} scan: ${roots.length} result roots found`);
 
   // When force download is on, ignore the history so already-downloaded posts
@@ -354,33 +449,60 @@ const scanApiResolvedPosts = async (
         // Cheap, fetch-free checks first so we never re-fetch JSON/HLS for posts
         // already downloaded or filtered out (re-fetching invites rate limiting).
         const thingId = getThingId(root);
-        if (!thingId) return null;
-
-        if (processedSet.has(thingId)) {
-          logger.log(`Skipping already processed post: ${thingId}`);
+        if (!thingId) {
+          recordSkip(diagnostics, {
+            postId: `(unidentified ${label} result)`,
+            reason: "no-post-id",
+            detail: describeElement(root),
+            source: label,
+          });
           return null;
         }
 
-        if (skipSet.has(thingId)) {
-          logger.log(`Skipping post that failed to download: ${thingId}`);
+        const note = (reason: SkipReason, detail?: string): null => {
+          recordSkip(
+            diagnostics,
+            { postId: thingId, reason, detail, source: label },
+            () => ({
+              ...describe?.(root),
+              permalink: permalinkForPostId(thingId),
+            }),
+          );
           return null;
-        }
+        };
 
-        if (unsupportedThingIds.has(thingId)) {
-          logger.log(`Skipping unsupported post (cached): ${thingId}`);
-          return null;
-        }
+        if (processedSet.has(thingId)) return note("already-processed");
+        if (skipSet.has(thingId)) return note("failed-earlier-this-run");
+        if (unsupportedThingIds.has(thingId)) return note("unsupported-cached");
 
         if (!isPostInDateRange(root, startDate, endDate)) {
-          logger.log(`Skipping post outside date range: ${thingId}`);
-          return null;
+          return note("outside-date-range", getPostDatetime(root) || undefined);
         }
 
-        const media = await extractMedia(root);
+        let media: SearchResultMedia | null;
+        try {
+          media = await extractMedia(root);
+        } catch (error) {
+          unsupportedThingIds.add(thingId);
+          return note(
+            "extract-threw",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+
         if (!media) {
           // No downloadable media this session: don't re-fetch it next cycle.
           unsupportedThingIds.add(thingId);
-          return null;
+          return note(
+            "post-json-no-media",
+            "the post JSON yielded no downloadable media (external host, text post with archiving off, or a fetch that failed)",
+          );
+        }
+
+        // Text posts legitimately carry no URLs — the archive is the payload.
+        if (media.type !== "text" && media.urls.length === 0) {
+          unsupportedThingIds.add(thingId);
+          return note("no-media-urls", `type=${media.type}`);
         }
 
         // Tag the root so HIGHLIGHT_CURRENT_POST / MARK_POST_VISITED can find it.
@@ -401,15 +523,15 @@ const scanApiResolvedPosts = async (
     ),
   );
 
-  logger.log(
-    `${label} scan: ${mediaCount} of ${roots.length} resolved to media`,
-  );
+  logScanSummary(`${label} scan`, roots.length, mediaCount, diagnostics);
 
   return {
     success: true,
     data: {
       totalPosts: mediaCount,
       mediaUrls,
+      skipped: diagnostics.all,
+      examined: roots.length,
     },
   };
 };
@@ -427,7 +549,17 @@ export default defineContentScript({
   matches: ["*://*.reddit.com/*"],
   cssInjectionMode: "ui",
   async main(ctx) {
-    const mountedUIs = new Set();
+    /**
+     * Posts we've already mounted a download button onto.
+     *
+     * This was a strong `Set`, and Reddit's feed removes post elements as they
+     * scroll out of view — so every post ever scrolled past stayed resident
+     * along with its shadow root and its mounted React root. Scrolling a few
+     * thousand posts retained a few thousand detached DOM subtrees. A WeakSet
+     * answers the same has/add questions while letting the element, and
+     * everything hanging off it, be collected once Reddit drops it.
+     */
+    const mountedUIs = new WeakSet<Element>();
 
     const getMediaContainer = (
       element: Element,
@@ -565,13 +697,14 @@ export default defineContentScript({
     // Re-apply downloaded markers live as downloads complete (mass or single)
     // and when the show/hide setting is toggled.
     processedPostIds.watch(() => {
+      invalidateProcessedIdCache();
       refreshDownloadedMarkers();
     });
     showDownloadedMarkers.watch(() => {
       refreshDownloadedMarkers();
     });
 
-    let scrollTimeout: NodeJS.Timeout;
+    let scrollTimeout: ReturnType<typeof setTimeout> | undefined;
     const handleScroll = () => {
       clearTimeout(scrollTimeout);
       scrollTimeout = setTimeout(async () => {
@@ -582,6 +715,16 @@ export default defineContentScript({
     };
 
     window.addEventListener("scroll", handleScroll, { passive: true });
+
+    // Reddit is a SPA; the content script context is invalidated on navigation.
+    // Drop the listener, the pending timer and the caches with it, rather than
+    // leaving them attached to a dead context.
+    ctx.onInvalidated(() => {
+      window.removeEventListener("scroll", handleScroll);
+      clearTimeout(scrollTimeout);
+      invalidateProcessedIdCache();
+      unsupportedThingIds.clear();
+    });
 
     onMessage("GET_CURRENT_POST_ID", async () => {
       const posts = Array.from(document.querySelectorAll("shreddit-post"));
@@ -639,6 +782,10 @@ export default defineContentScript({
               extractOldRedditPostMedia(root, {
                 includeTextPosts: await savePostArchive.getValue(),
               }),
+            describe: (root) => ({
+              title: root.querySelector("a.title")?.textContent?.trim(),
+              subreddit: root.getAttribute("data-subreddit") ?? undefined,
+            }),
           },
           skipPostIds,
         );
@@ -651,6 +798,10 @@ export default defineContentScript({
             roots: getSearchResultRoots(),
             getThingId: getSearchThingId,
             extractMedia: extractSearchResultMedia,
+            describe: (root) => ({
+              title: getSearchPostTitle(root) || undefined,
+              subreddit: getSearchSubredditName(root),
+            }),
           },
           skipPostIds,
         );
@@ -681,6 +832,7 @@ export default defineContentScript({
       }
 
       let mediaCount = 0;
+      const diagnostics = new DiagnosticsCollector(isDebugEnabled());
 
       // Get already processed post IDs from storage. When force download is on,
       // ignore the history so already-downloaded posts get re-grabbed.
@@ -703,45 +855,74 @@ export default defineContentScript({
 
       const mediaUrls = compact(
         await Promise.all(
-          postsArray.map(async (post, index) => {
+          postsArray.map(async (post) => {
+            const uniqueId = setPostIdentifier(post);
+
+            const note = (reason: SkipReason, detail?: string): null => {
+              recordSkip(
+                diagnostics,
+                { postId: uniqueId, reason, detail, source: "Feed" },
+                () => ({
+                  title: getPostTitle(post) || undefined,
+                  subreddit: getSubredditNameFromContainer(post),
+                  permalink: permalinkForPostId(uniqueId),
+                }),
+              );
+              return null;
+            };
+
             const mediaContainer = getMediaContainer(post);
 
             // Posts without media are only collected when their text is being
-            // archived.
-            if (!mediaContainer && !archiveTextPosts) return null;
-
-            const uniqueId = setPostIdentifier(post);
+            // archived. The most common silent drop: text posts, crossposts,
+            // link posts, polls, and anything whose media element Reddit
+            // renamed under us.
+            if (!mediaContainer && !archiveTextPosts) {
+              return note("no-media-container", describeElement(post));
+            }
 
             // Skip if we've already processed this post
-            if (processedSet.has(uniqueId)) {
-              logger.log(`Skipping already processed post: ${uniqueId}`);
-              return null;
-            }
-
-            if (skipSet.has(uniqueId)) {
-              logger.log(`Skipping post that failed to download: ${uniqueId}`);
-              return null;
-            }
+            if (processedSet.has(uniqueId)) return note("already-processed");
+            if (skipSet.has(uniqueId)) return note("failed-earlier-this-run");
 
             // Check if post is within date range
             if (!isPostInDateRange(post, startDate, endDate)) {
-              logger.log(`Skipping post outside date range: ${uniqueId}`);
-              return null;
+              return note(
+                "outside-date-range",
+                getPostDatetime(post) || undefined,
+              );
             }
 
             const subredditName = getSubredditNameFromContainer(
               mediaContainer?.element.closest("shreddit-post") || post,
             );
 
+            let urls: string[] = [];
+            if (mediaContainer) {
+              try {
+                urls = await getDownloadUrlsFromContainer(
+                  mediaContainer.element,
+                  mediaContainer.type,
+                );
+              } catch (error) {
+                return note(
+                  "extract-threw",
+                  error instanceof Error ? error.message : String(error),
+                );
+              }
+
+              // A media element yielding no URLs used to be forwarded anyway
+              // (mediaCount was incremented before the URLs were resolved), and
+              // the empty list came back from the background as a success.
+              if (urls.length === 0) {
+                return note("no-media-urls", `type=${mediaContainer.type}`);
+              }
+            }
+
             mediaCount++;
 
             return {
-              urls: mediaContainer
-                ? await getDownloadUrlsFromContainer(
-                    mediaContainer.element,
-                    mediaContainer.type,
-                  )
-                : [],
+              urls,
               type: mediaContainer?.type ?? ("text" as const),
               subredditName,
               mediaPostId: uniqueId,
@@ -753,11 +934,15 @@ export default defineContentScript({
         ),
       );
 
+      logScanSummary("Feed scan", postsArray.length, mediaCount, diagnostics);
+
       return {
         success: true,
         data: {
           totalPosts: mediaCount,
           mediaUrls,
+          skipped: diagnostics.all,
+          examined: postsArray.length,
         },
       };
     });

@@ -21,7 +21,21 @@ import {
 import { debounce } from "es-toolkit";
 import { sendMessage } from "webext-bridge/popup";
 import { useScrapingProgress } from "./use-scraping-progress";
-import { processedPostIds } from "@/utils/storage";
+import {
+  processedPostIds,
+  addProcessedPostId,
+  addProcessedPostIds,
+  flushProcessedPostIds,
+  resetProcessedPostIdCache,
+  debugLogging as debugLoggingStorage,
+} from "@/utils/storage";
+import {
+  formatDiagnosticsReport,
+  isFailure,
+  permalinkForPostId,
+  type PostDiagnostic,
+} from "@/utils/diagnostics";
+import { createTextFileUrl, downloadAndRelease, revokeIfObjectUrl } from "@/utils/blob-utils";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -136,6 +150,7 @@ function SidebarApp() {
   });
 
   const [isClearingHistory, setIsClearingHistory] = useState(false);
+  const [debugLogging, setDebugLogging] = useState(false);
   const [currentUrl, setCurrentUrl] = useState<string>("");
   const [isRedditPage, setIsRedditPage] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -161,6 +176,7 @@ function SidebarApp() {
         dateRangeStart,
         dateRangeEnd,
         darkMode,
+        debugLoggingValue,
       ] = await Promise.all([
         folderDestinationStorage.getValue(),
         filenamePatternStorage.getValue(),
@@ -176,10 +192,10 @@ function SidebarApp() {
         dateRangeStartStorage.getValue(),
         dateRangeEndStorage.getValue(),
         darkModeStorage.getValue(),
+        debugLoggingStorage.getValue(),
       ]);
 
-      console.log("dateRangeStart", dateRangeStart);
-      console.log("dateRangeEnd", dateRangeEnd);
+      setDebugLogging(debugLoggingValue || false);
 
       form.reset({
         folderDestination:
@@ -339,10 +355,46 @@ function SidebarApp() {
     incrementDownloadCount,
     addToTotalPostsFound,
     setCurrentPostInfo,
+    recordFailure,
+    addScanTotals,
   } = useScrapingProgress();
 
   // Ref to control continuous processing loop
   const shouldContinueProcessingRef = useRef(false);
+
+  /**
+   * Every post this run did not download, with the reason. Accumulated across
+   * scan passes so a run can be audited afterwards rather than relying on
+   * whatever happens to still be in the console.
+   */
+  const diagnosticsRef = useRef<PostDiagnostic[]>([]);
+  /**
+   * postId+reason pairs already recorded. A post with no media element is
+   * re-examined on every scan cycle (nothing adds it to a skip set), so without
+   * this the same handful of text posts would be appended every few seconds.
+   */
+  const seenDiagnosticsRef = useRef<Set<string>>(new Set());
+  const runStartedAtRef = useRef<number | null>(null);
+  /** Live count, readable from async callbacks where state would be stale. */
+  const downloadedCountRef = useRef(0);
+  const [diagnosticsCount, setDiagnosticsCount] = useState(0);
+  const [isSavingReport, setIsSavingReport] = useState(false);
+
+  const DIAGNOSTICS_LIMIT = 5000;
+
+  const pushDiagnostics = (records: PostDiagnostic[]) => {
+    if (records.length === 0) return;
+    let added = 0;
+    for (const record of records) {
+      if (diagnosticsRef.current.length >= DIAGNOSTICS_LIMIT) break;
+      const key = `${record.postId}|${record.reason}`;
+      if (seenDiagnosticsRef.current.has(key)) continue;
+      seenDiagnosticsRef.current.add(key);
+      diagnosticsRef.current.push(record);
+      added += 1;
+    }
+    if (added > 0) setDiagnosticsCount(diagnosticsRef.current.length);
+  };
 
   // Fed into each scan as skipPostIds so a failing post can't loop forever.
   const failedPostIdsRef = useRef<Set<string>>(new Set());
@@ -367,8 +419,13 @@ function SidebarApp() {
       shouldContinueProcessingRef.current = true;
       failedPostIdsRef.current = new Set();
       handledThisRunRef.current = new Set();
+      diagnosticsRef.current = [];
+      seenDiagnosticsRef.current = new Set();
+      downloadedCountRef.current = 0;
+      runStartedAtRef.current = Date.now();
+      setDiagnosticsCount(0);
 
-      logger.log("Starting mass scraping from sidebar");
+      logger.always("Starting mass download");
 
       const processPage = async () => {
         let scanPayload: {
@@ -417,6 +474,11 @@ function SidebarApp() {
 
         const { mediaUrls } = response.data;
 
+        // Posts the content script examined but never queued, with reasons.
+        const scanSkips = response.data.skipped ?? [];
+        pushDiagnostics(scanSkips);
+        addScanTotals(scanSkips.length, response.data.examined ?? 0);
+
         // Mark every scanned post as handled this run so it isn't re-scanned on
         // the next cycle (needed for loop termination when force download
         // ignores the persistent processed history).
@@ -439,12 +501,22 @@ function SidebarApp() {
             ),
         );
         if (skippedByFilter.length > 0) {
-          const currentProcessedIds = await processedPostIds.getValue();
-          const merged = new Set([
-            ...currentProcessedIds,
-            ...skippedByFilter.map((item) => item.mediaPostId),
-          ]);
-          await processedPostIds.setValue([...merged]);
+          // Batched write rather than read-spread-write per post.
+          await addProcessedPostIds(
+            skippedByFilter.map((item) => item.mediaPostId),
+          );
+          pushDiagnostics(
+            skippedByFilter.map((item) => ({
+              postId: item.mediaPostId,
+              stage: "filter" as const,
+              reason: "media-type-filtered" as const,
+              detail: `type=${item.type}, filter=${massDownloadMediaFilter}`,
+              title: item.postTitle,
+              subreddit: item.subredditName,
+              permalink: permalinkForPostId(item.mediaPostId),
+              at: Date.now(),
+            })),
+          );
           logger.log(
             `Skipped ${skippedByFilter.length} post(s) (media type filter: ${massDownloadMediaFilter})`,
           );
@@ -528,17 +600,13 @@ function SidebarApp() {
             );
 
             if (downloadResponse?.success) {
-              logger.log(`Download ${i + 1} started successfully`);
+              logger.log(`Download ${i + 1} completed`);
               incrementDownloadCount();
+              downloadedCountRef.current += 1;
 
-              // Mark this post as processed in storage
-              const currentProcessedIds = await processedPostIds.getValue();
-              if (!currentProcessedIds.includes(mediaItem.mediaPostId)) {
-                await processedPostIds.setValue([
-                  ...currentProcessedIds,
-                  mediaItem.mediaPostId,
-                ]);
-              }
+              // Mark this post as processed. Buffered and flushed in batches
+              // instead of rewriting the whole id array per download.
+              await addProcessedPostId(mediaItem.mediaPostId);
 
               if (form.getValues("markDownloadedAsVisited")) {
                 try {
@@ -552,8 +620,28 @@ function SidebarApp() {
                 }
               }
             } else {
-              console.error(`Download ${i + 1} failed:`, downloadResponse);
+              const message = downloadResponse?.message ?? "no reason given";
+              const reason =
+                downloadResponse?.reason ?? "download-request-failed";
+              // Always logged, with enough to find the post again.
+              logger.error(
+                `Download failed for ${mediaItem.mediaPostId} (${mediaItem.type}, r/${mediaItem.subredditName}): ${message}`,
+                permalinkForPostId(mediaItem.mediaPostId) ?? "",
+              );
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
+              recordFailure(mediaItem.mediaPostId, reason);
+              pushDiagnostics([
+                {
+                  postId: mediaItem.mediaPostId,
+                  stage: "download",
+                  reason,
+                  detail: message,
+                  title: mediaItem.postTitle,
+                  subreddit: mediaItem.subredditName,
+                  permalink: permalinkForPostId(mediaItem.mediaPostId),
+                  at: Date.now(),
+                },
+              ]);
             }
 
             // Pause between downloads so Reddit doesn't rate limit the page
@@ -566,14 +654,36 @@ function SidebarApp() {
               await new Promise((resolve) => setTimeout(resolve, delayMs));
             }
           } catch (error) {
-            console.error(`Failed to download item ${i + 1}:`, error);
+            const message =
+              error instanceof Error ? error.message : String(error);
+            logger.error(
+              `Download threw for ${mediaItem.mediaPostId} (${mediaItem.type}, r/${mediaItem.subredditName}): ${message}`,
+              permalinkForPostId(mediaItem.mediaPostId) ?? "",
+            );
             failedPostIdsRef.current.add(mediaItem.mediaPostId);
+            recordFailure(mediaItem.mediaPostId, "download-threw");
+            pushDiagnostics([
+              {
+                postId: mediaItem.mediaPostId,
+                stage: "download",
+                reason: "download-threw",
+                detail: message,
+                title: mediaItem.postTitle,
+                subreddit: mediaItem.subredditName,
+                permalink: permalinkForPostId(mediaItem.mediaPostId),
+                at: Date.now(),
+              },
+            ]);
           }
         }
 
+        // Make sure buffered processed-ids reach storage at the end of each
+        // batch, not only when the buffer happens to fill up.
+        await flushProcessedPostIds();
+
         const newPostsFound = mediaUrls.length > 0;
-        logger.log(
-          `Batch complete! Processed ${mediaUrls.length} new post(s); attempted download for ${filteredMediaUrls.length}.`,
+        logger.always(
+          `Batch complete: ${mediaUrls.length} queued, ${filteredMediaUrls.length} attempted, ${scanSkips.length} skipped during scan.`,
         );
         setCurrentPostInfo(null);
 
@@ -592,10 +702,12 @@ function SidebarApp() {
             }, 2000);
           } else {
             if (massDownloadScrollUp) {
-              logger.log(
+              logger.always(
                 "No new posts found; reached the top. Mass download complete.",
               );
+              await flushProcessedPostIds();
               stopScraping();
+              logRunSummary();
             } else {
               logger.log("No new posts found, scrolling to load more...");
               await sendMessage(
@@ -614,14 +726,16 @@ function SidebarApp() {
             }
           }
         } else {
-          logger.log("Processing stopped by user");
+          logger.always("Processing stopped by user");
+          await flushProcessedPostIds();
           stopScraping();
+          logRunSummary();
         }
       };
 
       processPage();
     } catch (error) {
-      console.error("Failed to start mass scraping:", error);
+      logger.error("Failed to start mass scraping:", error);
       shouldContinueProcessingRef.current = false;
       stopScraping();
     }
@@ -632,9 +746,63 @@ function SidebarApp() {
       shouldContinueProcessingRef.current = false;
       setCurrentPostInfo(null);
       stopScraping();
-      logger.log("Mass scraping stopped");
+      await flushProcessedPostIds();
+      logRunSummary();
     } catch (error) {
-      console.error("Failed to stop mass scraping:", error);
+      logger.error("Failed to stop mass scraping:", error);
+    }
+  };
+
+  /** Always-visible end-of-run accounting, debug mode or not. */
+  const logRunSummary = () => {
+    const records = diagnosticsRef.current;
+    const failures = records.filter((record) => isFailure(record.reason));
+    // Read from the ref, not from state — this runs inside async callbacks
+    // whose closed-over state is from whenever the run started.
+    logger.always(
+      `Mass download finished — downloaded ${downloadedCountRef.current}, failed ${failures.length}, skipped ${records.length - failures.length}.`,
+    );
+    if (records.length > 0) {
+      logger.always(
+        "Reasons:",
+        records.reduce<Record<string, number>>((counts, record) => {
+          counts[record.reason] = (counts[record.reason] ?? 0) + 1;
+          return counts;
+        }, {}),
+      );
+      logger.always(
+        'Use "Save diagnostics report" in the sidebar for the per-post detail.',
+      );
+    }
+  };
+
+  /**
+   * Write the accumulated diagnostics out as a text file, so a run can be
+   * audited without keeping a console open for the whole thing.
+   */
+  const handleSaveDiagnostics = async () => {
+    if (diagnosticsRef.current.length === 0) return;
+    setIsSavingReport(true);
+    let url: string | null = null;
+    try {
+      const report = formatDiagnosticsReport(diagnosticsRef.current, {
+        url: currentUrl,
+        startedAt: runStartedAtRef.current ?? undefined,
+        finishedAt: Date.now(),
+      });
+      url = createTextFileUrl(report, "text/plain;charset=utf-8");
+      const stamp = new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")
+        .replace("T", "_")
+        .slice(0, 19);
+      await downloadAndRelease(url, `RedditGrab/diagnostics_${stamp}.txt`);
+      url = null;
+    } catch (error) {
+      logger.error("Failed to save diagnostics report:", error);
+      if (url) revokeIfObjectUrl(url);
+    } finally {
+      setIsSavingReport(false);
     }
   };
 
@@ -642,6 +810,7 @@ function SidebarApp() {
     try {
       setIsClearingHistory(true);
       await processedPostIds.setValue([]);
+      resetProcessedPostIdCache();
       logger.log("Cleared processed posts history");
       // Small delay to show the loading state
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -1230,6 +1399,23 @@ function SidebarApp() {
               value={massDownloadMediaFilter}
               onValueChange={setMassDownloadMediaFilter}
             />
+            <div className="flex flex-row items-center space-x-2">
+              <Checkbox
+                id="debug-logging"
+                checked={debugLogging}
+                onCheckedChange={async (checked) => {
+                  const value = checked === true;
+                  setDebugLogging(value);
+                  await debugLoggingStorage.setValue(value);
+                }}
+              />
+              <label
+                htmlFor="debug-logging"
+                className="text-xs text-gray-500 dark:text-gray-400 leading-none cursor-pointer select-none"
+              >
+                Debug logging (console)
+              </label>
+            </div>
           </div>
         )}
 
@@ -1279,6 +1465,66 @@ function SidebarApp() {
                 </p>
               </div>
             )}
+
+            {/* What didn't make it. A download that fails is visible here
+                rather than only as a count that quietly stops rising. */}
+            <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs">
+              <span className="text-green-700 dark:text-green-400">
+                {scrapingStatus.downloadedCount} downloaded
+              </span>
+              <span
+                className={
+                  scrapingStatus.failedCount > 0
+                    ? "text-red-600 dark:text-red-400 font-medium"
+                    : "text-gray-500 dark:text-gray-400"
+                }
+              >
+                {scrapingStatus.failedCount} failed
+              </span>
+              <span className="text-gray-500 dark:text-gray-400">
+                {scrapingStatus.skippedCount} skipped of{" "}
+                {scrapingStatus.examinedCount} seen
+              </span>
+            </div>
+            {scrapingStatus.lastFailure && (
+              <p className="mt-1 text-xs text-red-600 dark:text-red-400 break-all">
+                Last failure: {scrapingStatus.lastFailure.postId} —{" "}
+                {scrapingStatus.lastFailure.reason}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Diagnostics export, available during and after a run. */}
+        {diagnosticsCount > 0 && (
+          <div className="rounded border border-gray-200 dark:border-gray-700 p-3">
+            <p className="text-xs text-gray-600 dark:text-gray-300 mb-2">
+              {diagnosticsCount} post
+              {diagnosticsCount === 1 ? " was" : "s were"} not downloaded this
+              run.
+            </p>
+            <Button
+              onClick={handleSaveDiagnostics}
+              variant="outline"
+              size="sm"
+              disabled={isSavingReport}
+              className="w-full text-xs"
+            >
+              {isSavingReport ? (
+                <>
+                  <Icon
+                    icon="lucide:loader-2"
+                    className="animate-spin mr-1 size-3"
+                  />
+                  Saving...
+                </>
+              ) : (
+                <>
+                  <Icon icon="lucide:file-text" className="mr-1 size-3" />
+                  Save diagnostics report
+                </>
+              )}
+            </Button>
           </div>
         )}
       </div>

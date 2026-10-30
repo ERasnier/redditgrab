@@ -6,11 +6,9 @@
   "type": "module",
   "scripts": {
     "dev": "wxt",
-    "dev:firefox": "wxt -b firefox",
     "build": "wxt build",
-    "build:firefox": "wxt build -b firefox",
     "zip": "wxt zip",
-    "zip:firefox": "wxt zip -b firefox",
+    "sign": "web-ext sign --channel=unlisted --source-dir .output/firefox-mv2",
     "compile": "tsc --noEmit",
     "postinstall": "wxt prepare"
   },
@@ -43,7 +41,6 @@
   },
   "devDependencies": {
     "@tailwindcss/vite": "4.1.12",
-    "@types/chrome": "^0.1.27",
     "@types/react": "19.2.2",
     "@types/react-dom": "19.2.2",
     "@wxt-dev/auto-icons": "^1.1.0",

@@ -1,5 +1,6 @@
 import { ProtocolWithReturn } from "webext-bridge";
 import { MediaContentType } from "../types";
+import type { PostDiagnostic, SkipReason } from "../utils/diagnostics";
 
 export interface ScanPageMediaMessage {
   success: boolean;
@@ -14,6 +15,10 @@ export interface ScanPageMediaMessage {
       postAuthor?: string;
       postDate?: string;
     }[];
+    /** Every post the scan looked at and did not turn into a candidate. */
+    skipped?: PostDiagnostic[];
+    /** How many post elements were examined in this pass. */
+    examined?: number;
   };
 }
 
@@ -50,6 +55,8 @@ export interface DownloadRequestMessage {
 export interface DownloadRequestResponse {
   success: boolean;
   message?: string;
+  /** Diagnostic reason code when success is false. */
+  reason?: SkipReason;
 }
 
 declare module "webext-bridge" {

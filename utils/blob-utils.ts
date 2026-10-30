@@ -1,68 +1,121 @@
+import { logger } from "./logger";
+import { verifyDownloads } from "./storage";
+
 /**
- * Create a blob URL that works in both Chrome Manifest V3 and Firefox
- * Falls back to data URL if URL.createObjectURL is not available
+ * Object URL for a blob. Firefox's background page has URL.createObjectURL, so
+ * the base64 data-URL fallback the Chrome MV3 service worker needed is gone.
+ *
+ * Every URL handed out here pins its blob in memory until revoked, so callers
+ * must pass it to `downloadAndRelease` (or revoke it themselves).
  */
 export async function createBlobUrl(blob: Blob): Promise<string> {
-  if (typeof URL !== "undefined" && URL.createObjectURL) {
-    return URL.createObjectURL(blob);
-  }
-
-  return await convertBlobToDataUrl(blob);
+  return URL.createObjectURL(blob);
 }
+
+/** Give up after this long with no new bytes. Progress resets the clock. */
+const DOWNLOAD_STALL_TIMEOUT_MS = 2 * 60 * 1000;
+/** Absolute ceiling, so nothing waits forever. */
+const DOWNLOAD_MAX_WAIT_MS = 30 * 60 * 1000;
+/** How often to ask the downloads API for progress. */
+const DOWNLOAD_POLL_INTERVAL_MS = 2000;
+
+type TerminalState =
+  | { state: "complete"; filename?: string; bytes?: number }
+  | { state: "interrupted"; error: string }
+  | { state: "stalled"; bytes: number };
 
 /**
- * Convert blob to data URL for Chrome Manifest V3 compatibility
+ * Wait for the browser's own terminal state for a download.
+ *
+ * `downloads.onChanged` does NOT fire for byte progress — only for state,
+ * filename, danger, pause and error changes. A large video can therefore
+ * produce no events for minutes and then complete, so a flat timeout can't tell
+ * "slow" from "stalled". Polling `bytesReceived` can.
  */
-function convertBlobToDataUrl(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => {
-      resolve(reader.result as string);
-    };
-    reader.onerror = () => {
-      reject(new Error("Failed to convert blob to data URL"));
-    };
-    reader.readAsDataURL(blob);
-  });
-}
-
-// Upper bound on how long we hold a file's memory waiting for the browser to
-// finish writing it, so a stuck download can't pin it forever.
-const DOWNLOAD_SETTLE_TIMEOUT_MS = 10 * 60 * 1000;
-
-/** Resolve once a download completes, is interrupted, or the timeout passes. */
-function waitForDownloadToSettle(downloadId: number): Promise<void> {
+function waitForDownloadToSettle(downloadId: number): Promise<TerminalState> {
   return new Promise((resolve) => {
     let settled = false;
-    const finish = () => {
+    let lastBytes = -1;
+    let lastProgressAt = Date.now();
+    const startedAt = Date.now();
+
+    const finish = (result: TerminalState) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      clearInterval(poll);
       browser.downloads.onChanged.removeListener(listener);
-      resolve();
+      resolve(result);
     };
+
+    // Fast path: settle the moment the browser announces a terminal state.
     const listener = (delta: Browser.downloads.DownloadDelta) => {
+      if (delta.id !== downloadId) return;
       const state = delta.state?.current;
-      if (delta.id === downloadId && state && state !== "in_progress") {
-        finish();
+      if (state === "complete") {
+        finish({ state: "complete", filename: delta.filename?.current });
+      } else if (state === "interrupted") {
+        finish({
+          state: "interrupted",
+          error: delta.error?.current ?? "interrupted",
+        });
       }
     };
-    const timer = setTimeout(finish, DOWNLOAD_SETTLE_TIMEOUT_MS);
     browser.downloads.onChanged.addListener(listener);
 
-    // The download may have finished before the listener was attached.
-    browser.downloads
-      .search({ id: downloadId })
-      .then(([item]) => {
-        if (!item || item.state !== "in_progress") finish();
-      })
-      .catch(() => {});
+    const poll = setInterval(async () => {
+      if (settled) return;
+      let item: Browser.downloads.DownloadItem | undefined;
+      try {
+        [item] = await browser.downloads.search({ id: downloadId });
+      } catch {
+        // An API hiccup is "no news", not a failure.
+        return;
+      }
+      if (settled) return;
+
+      if (!item) {
+        // Gone from the download list entirely (cleared, or never started).
+        finish({ state: "stalled", bytes: Math.max(lastBytes, 0) });
+        return;
+      }
+      if (item.state === "complete") {
+        finish({
+          state: "complete",
+          filename: item.filename,
+          bytes: item.fileSize > 0 ? item.fileSize : item.bytesReceived,
+        });
+        return;
+      }
+      if (item.state === "interrupted") {
+        finish({ state: "interrupted", error: item.error ?? "interrupted" });
+        return;
+      }
+
+      const received = item.bytesReceived ?? 0;
+      if (received > lastBytes) {
+        lastBytes = received;
+        lastProgressAt = Date.now();
+        return;
+      }
+      if (
+        Date.now() - lastProgressAt >= DOWNLOAD_STALL_TIMEOUT_MS ||
+        Date.now() - startedAt >= DOWNLOAD_MAX_WAIT_MS
+      ) {
+        finish({ state: "stalled", bytes: Math.max(lastBytes, 0) });
+      }
+    }, DOWNLOAD_POLL_INTERVAL_MS);
   });
 }
 
 /**
- * Start a download. For object URLs, also wait until the browser has written
- * the file, since the URL (and the blob behind it) must stay alive until then.
+ * Start a download and wait until the browser has actually written the file.
+ *
+ * This used to wait only for `blob:` URLs, because the point was keeping the
+ * blob alive long enough to be read. But `downloads.download()` resolves as
+ * soon as the download is *queued*, so for a direct URL a 403 from the CDN, a
+ * full disk or a dropped connection all looked like success — the post was
+ * marked processed with nothing on disk. Every download is now waited on, and a
+ * failure throws.
  */
 export async function downloadAndWait(url: string, filename?: string) {
   const downloadId = await browser.downloads.download({
@@ -70,14 +123,35 @@ export async function downloadAndWait(url: string, filename?: string) {
     filename,
     saveAs: false,
   });
-  if (url.startsWith("blob:") && downloadId !== undefined) {
-    await waitForDownloadToSettle(downloadId);
+
+  if (downloadId === undefined) {
+    throw new Error("browser did not return a download id");
   }
+  if (!(await verifyDownloads.getValue())) {
+    return;
+  }
+
+  const result = await waitForDownloadToSettle(downloadId);
+  if (result.state === "interrupted") {
+    throw new Error(`download interrupted: ${result.error}`);
+  }
+  if (result.state === "stalled") {
+    throw new Error(
+      `download stalled after ${result.bytes} bytes with no progress for ${DOWNLOAD_STALL_TIMEOUT_MS / 1000}s`,
+    );
+  }
+  logger.log(`Download ${downloadId} complete: ${result.filename ?? filename}`);
 }
 
 /** Free an object URL's blob. No-op for regular and data URLs. */
 export function revokeIfObjectUrl(url: string) {
-  if (url.startsWith("blob:")) URL.revokeObjectURL(url);
+  if (url.startsWith("blob:")) {
+    try {
+      URL.revokeObjectURL(url);
+    } catch {
+      // Revoking after teardown, or from the wrong context, is harmless.
+    }
+  }
 }
 
 /**
@@ -93,21 +167,7 @@ export async function downloadAndRelease(url: string, filename: string) {
   }
 }
 
-/**
- * URL for a generated text file. Uses an object URL where available; Chrome's
- * background service worker has neither URL.createObjectURL nor FileReader, so
- * it gets a base64 data URL instead.
- */
+/** Object URL for a generated text file, such as a post archive. */
 export function createTextFileUrl(text: string, mimeType: string): string {
-  if (typeof URL !== "undefined" && URL.createObjectURL) {
-    return URL.createObjectURL(new Blob([text], { type: mimeType }));
-  }
-
-  const bytes = new TextEncoder().encode(text);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
-  }
-  return `data:${mimeType};base64,${btoa(binary)}`;
+  return URL.createObjectURL(new Blob([text], { type: mimeType }));
 }
