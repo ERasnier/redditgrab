@@ -34,6 +34,20 @@ export interface HighlightPostResponse {
 
 export interface ScrollToLoadMoreResponse {
   success: boolean;
+  /** Whether more posts (or more page) actually appeared after scrolling. */
+  grew: boolean;
+  postsBefore: number;
+  postsAfter: number;
+  heightBefore: number;
+  heightAfter: number;
+  atBottom: boolean;
+}
+
+export interface PingResponse {
+  success: boolean;
+  url: string;
+  posts: number;
+  layout: "feed" | "search" | "old-reddit";
 }
 
 export interface DownloadRequestMessage {
@@ -81,6 +95,7 @@ declare module "webext-bridge" {
       { scrollUp?: boolean },
       ScrollToLoadMoreResponse
     >;
+    PING: ProtocolWithReturn<void, PingResponse>;
     DOWNLOAD_REQUEST: ProtocolWithReturn<
       DownloadRequestMessage,
       DownloadRequestResponse

@@ -13,6 +13,7 @@ import {
   forceDownloadProcessed as forceDownloadProcessedStorage,
   requestDelaySeconds as requestDelaySecondsStorage,
   savePostArchive as savePostArchiveStorage,
+  urlQueueText as urlQueueTextStorage,
   useDateRange as useDateRangeStorage,
   dateRangeStart as dateRangeStartStorage,
   dateRangeEnd as dateRangeEndStorage,
@@ -35,6 +36,12 @@ import {
   permalinkForPostId,
   type PostDiagnostic,
 } from "@/utils/diagnostics";
+import { parseUrlQueue, isSameRedditPage } from "@/utils/url-queue";
+import { runPageUntilExhausted } from "@/utils/page-runner";
+import {
+  UrlQueueInput,
+  type QueueEntryStatus,
+} from "@/components/url-queue-input";
 import { createTextFileUrl, downloadAndRelease, revokeIfObjectUrl } from "@/utils/blob-utils";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
@@ -65,6 +72,117 @@ import {
   type MassDownloadMediaFilterValue,
 } from "@/components/mass-download-media-filter";
 import { processFolderDestination } from "@/utils/post-utils";
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * How many consecutive scrolls may load nothing before a page is treated as
+ * finished. Reddit's infinite scroll is intermittent — one quiet scroll near
+ * the end of a listing is normal — so a single miss isn't proof.
+ */
+const EMPTY_SCROLLS_BEFORE_DONE = 3;
+
+/** Longest to wait for a navigation to finish loading. */
+const NAV_LOAD_TIMEOUT_MS = 45_000;
+/** Longest to wait for the content script to answer on the new page. */
+const NAV_READY_TIMEOUT_MS = 20_000;
+
+/**
+ * Wait until the tab has finished loading the page we asked for.
+ *
+ * Checking only for `status === "complete"` isn't enough: for a moment after
+ * `tabs.update` the tab still reports the *previous* page as complete, so a
+ * naive check returns at once and the scan runs against the page we were trying
+ * to leave. Require the URL to have actually moved as well — either to the
+ * target, or somewhere else if Reddit redirected us.
+ */
+const waitForTabLoad = async (
+  tabId: number,
+  targetUrl: string,
+  previousUrl: string | undefined,
+) => {
+  const deadline = Date.now() + NAV_LOAD_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    await sleep(300);
+    let tab: Browser.tabs.Tab;
+    try {
+      tab = await browser.tabs.get(tabId);
+    } catch {
+      // The tab was closed under us; nothing left to download into.
+      throw new Error("the tab was closed");
+    }
+    if (tab.status !== "complete" || !tab.url) continue;
+
+    const arrived = isSameRedditPage(tab.url, targetUrl);
+    const movedOn = !previousUrl || tab.url !== previousUrl;
+    if (arrived || movedOn) {
+      if (!arrived) {
+        logger.warn(`Expected ${targetUrl} but landed on ${tab.url}`);
+      }
+      return tab.url;
+    }
+  }
+  throw new Error(
+    `page did not finish loading within ${NAV_LOAD_TIMEOUT_MS / 1000}s`,
+  );
+};
+
+/**
+ * Wait for the content script to respond on the newly loaded page.
+ *
+ * A freshly navigated tab accepts messages only once the content script has
+ * been injected and registered its handlers; scanning before then fails with a
+ * confusing bridge error, so poll a cheap PING until it answers.
+ */
+const waitForContentScript = async (tabId: number) => {
+  const deadline = Date.now() + NAV_READY_TIMEOUT_MS;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      const pong = await sendMessage(
+        "PING",
+        undefined,
+        `content-script@${tabId}`,
+      );
+      if (pong?.success) return pong;
+    } catch (error) {
+      lastError = error;
+    }
+    await sleep(500);
+  }
+  throw new Error(
+    `content script did not respond within ${NAV_READY_TIMEOUT_MS / 1000}s${
+      lastError ? ` (${String(lastError)})` : ""
+    }`,
+  );
+};
+
+/**
+ * Point the tab at a queued URL and wait until it is ready to be scanned.
+ * Skips the navigation when the tab is already on that page, so starting a
+ * queue whose first entry is the current page doesn't pointlessly reload it.
+ */
+const navigateTab = async (tabId: number, url: string) => {
+  let current: Browser.tabs.Tab | undefined;
+  try {
+    current = await browser.tabs.get(tabId);
+  } catch {
+    throw new Error("the tab was closed");
+  }
+
+  if (current?.url && isSameRedditPage(current.url, url)) {
+    logger.log(`Already on ${url}, not reloading`);
+    await waitForContentScript(tabId);
+    return;
+  }
+
+  await browser.tabs.update(tabId, { url });
+  await waitForTabLoad(tabId, url, current?.url);
+  const pong = await waitForContentScript(tabId);
+  logger.log(
+    `Opened ${pong.url} (${pong.layout} layout, ${pong.posts} posts on screen)`,
+  );
+};
 
 const debouncedSaveFolder = debounce(async (value: string) => {
   await folderDestinationStorage.setValue(value);
@@ -103,6 +221,10 @@ const debouncedSaveForceDownloadProcessed = debounce(async (value: boolean) => {
 
 const debouncedSaveRequestDelaySeconds = debounce(async (value: number) => {
   await requestDelaySecondsStorage.setValue(value);
+}, 500);
+
+const debouncedSaveUrlQueue = debounce(async (value: string) => {
+  await urlQueueTextStorage.setValue(value);
 }, 500);
 
 const debouncedSaveSavePostArchive = debounce(async (value: boolean) => {
@@ -151,6 +273,14 @@ function SidebarApp() {
 
   const [isClearingHistory, setIsClearingHistory] = useState(false);
   const [debugLogging, setDebugLogging] = useState(false);
+  // Raw textarea text, and the per-entry status of the run in progress.
+  const [urlQueueInput, setUrlQueueInput] = useState("");
+  const [queueStatuses, setQueueStatuses] = useState<QueueEntryStatus[]>([]);
+  const [queueProgress, setQueueProgress] = useState<{
+    index: number;
+    total: number;
+    label: string;
+  } | null>(null);
   const [currentUrl, setCurrentUrl] = useState<string>("");
   const [isRedditPage, setIsRedditPage] = useState(false);
   const [isDarkMode, setIsDarkMode] = useState(false);
@@ -177,6 +307,7 @@ function SidebarApp() {
         dateRangeEnd,
         darkMode,
         debugLoggingValue,
+        urlQueueValue,
       ] = await Promise.all([
         folderDestinationStorage.getValue(),
         filenamePatternStorage.getValue(),
@@ -193,9 +324,11 @@ function SidebarApp() {
         dateRangeEndStorage.getValue(),
         darkModeStorage.getValue(),
         debugLoggingStorage.getValue(),
+        urlQueueTextStorage.getValue(),
       ]);
 
       setDebugLogging(debugLoggingValue || false);
+      setUrlQueueInput(urlQueueValue || "");
 
       form.reset({
         folderDestination:
@@ -415,6 +548,23 @@ function SidebarApp() {
         throw new Error("No active tab found");
       }
 
+      // Entries are resolved up front so a typo surfaces before anything is
+      // downloaded rather than halfway through a long run.
+      const { entries: queue, errors: queueErrors } =
+        parseUrlQueue(urlQueueInput);
+      if (queueErrors.length > 0) {
+        logger.error(
+          `Ignoring ${queueErrors.length} unusable queue line(s):`,
+          queueErrors.map((e) => `line ${e.line}: ${e.text} — ${e.reason}`),
+        );
+      }
+
+      const delaySeconds = form.getValues("requestDelaySeconds");
+      const requestDelayMs =
+        Number.isFinite(delaySeconds) && delaySeconds >= 0
+          ? delaySeconds * 1000
+          : 1000;
+
       startScraping();
       shouldContinueProcessingRef.current = true;
       failedPostIdsRef.current = new Set();
@@ -424,23 +574,33 @@ function SidebarApp() {
       downloadedCountRef.current = 0;
       runStartedAtRef.current = Date.now();
       setDiagnosticsCount(0);
+      setQueueProgress(null);
+      setQueueStatuses([]);
 
-      logger.always("Starting mass download");
-
-      const processPage = async () => {
+      /**
+       * Scan the page once and download whatever that scan turned up.
+       * Returns how many posts were queued and attempted so the caller can
+       * decide whether the page still has anything left.
+       */
+      const processOneBatch = async (
+        scrollUp: boolean,
+      ): Promise<{
+        queued: number;
+        attempted: number;
+      }> => {
         let scanPayload: {
           scrollUp?: boolean;
           anchorPostId?: string;
           skipPostIds?: string[];
         } = {
-          scrollUp: massDownloadScrollUp,
+          scrollUp,
           skipPostIds: [
             ...failedPostIdsRef.current,
             ...handledThisRunRef.current,
           ],
         };
 
-        if (massDownloadScrollUp) {
+        if (scrollUp) {
           try {
             const anchorRes = await sendMessage(
               "GET_CURRENT_POST_ID",
@@ -681,62 +841,143 @@ function SidebarApp() {
         // batch, not only when the buffer happens to fill up.
         await flushProcessedPostIds();
 
-        const newPostsFound = mediaUrls.length > 0;
         logger.always(
           `Batch complete: ${mediaUrls.length} queued, ${filteredMediaUrls.length} attempted, ${scanSkips.length} skipped during scan.`,
         );
         setCurrentPostInfo(null);
 
-        // Continue processing if scraping is still active
-        if (shouldContinueProcessingRef.current) {
-          if (newPostsFound) {
-            // Found new posts, check again soon for more
-            logger.log(
-              "Found new posts, scheduling next check in 2 seconds...",
-            );
-            setTimeout(() => {
-              if (shouldContinueProcessingRef.current) {
-                logger.log("Checking for more new posts...");
-                processPage();
-              }
-            }, 2000);
-          } else {
-            if (massDownloadScrollUp) {
-              logger.always(
-                "No new posts found; reached the top. Mass download complete.",
-              );
-              await flushProcessedPostIds();
-              stopScraping();
-              logRunSummary();
-            } else {
-              logger.log("No new posts found, scrolling to load more...");
-              await sendMessage(
-                "SCROLL_TO_LOAD_MORE",
-                { scrollUp: massDownloadScrollUp },
-                `content-script@${tab.id}`,
-              );
-              logger.log(
-                "Scrolled to load more posts, checking again in 3 seconds...",
-              );
-              setTimeout(() => {
-                if (shouldContinueProcessingRef.current) {
-                  processPage();
-                }
-              }, 3000);
-            }
-          }
-        } else {
-          logger.always("Processing stopped by user");
-          await flushProcessedPostIds();
-          stopScraping();
-          logRunSummary();
-        }
+        return {
+          queued: mediaUrls.length,
+          attempted: filteredMediaUrls.length,
+        };
       };
 
-      processPage();
+      /**
+       * Download everything on the page the tab is currently showing, scrolling
+       * to pull in more as needed, and resolve once the page is exhausted.
+       *
+       * This replaces a chain of recursive setTimeouts that had no terminal
+       * state when scrolling down: it scrolled at the bottom of a finished
+       * listing forever. The scroll call now reports whether anything actually
+       * loaded, so an exhausted page can be recognised — which is also what
+       * lets the URL queue know when to move on.
+       */
+      const runCurrentPage = (scrollUp: boolean) =>
+        runPageUntilExhausted({
+          scrollUp,
+          processBatch: () => processOneBatch(scrollUp),
+          scrollForMore: async () => {
+            const scroll = await sendMessage(
+              "SCROLL_TO_LOAD_MORE",
+              { scrollUp },
+              `content-script@${tab.id}`,
+            );
+            return { grew: scroll?.grew === true };
+          },
+          shouldContinue: () => shouldContinueProcessingRef.current,
+          sleep,
+          log: (message) => logger.always(message),
+          emptyScrollsBeforeDone: EMPTY_SCROLLS_BEFORE_DONE,
+        });
+
+      const finish = async (note: string) => {
+        shouldContinueProcessingRef.current = false;
+        await flushProcessedPostIds();
+        setCurrentPostInfo(null);
+        setQueueProgress(null);
+        stopScraping();
+        logger.always(note);
+        logRunSummary();
+      };
+
+      // --- No queue: download the page the user is already looking at. ---
+      if (queue.length === 0) {
+        const outcome = await runCurrentPage(massDownloadScrollUp);
+        await finish(
+          outcome === "stopped"
+            ? "Processing stopped by user"
+            : "Mass download complete.",
+        );
+        return;
+      }
+
+      // --- Queue: navigate to each entry in turn. ---
+      // Every queued page opens at the top, so "scroll up from current post"
+      // has nothing to scroll up from; downloading each page top-to-bottom is
+      // the only sensible reading.
+      if (massDownloadScrollUp) {
+        logger.always(
+          'Ignoring "scroll up from current post" — each queued page starts at the top.',
+        );
+      }
+      logger.always(`Queue: ${queue.length} page(s) to visit`);
+      setQueueStatuses(queue.map(() => "pending"));
+
+      for (let index = 0; index < queue.length; index++) {
+        if (!shouldContinueProcessingRef.current) break;
+
+        const entry = queue[index];
+        setQueueProgress({
+          index: index + 1,
+          total: queue.length,
+          label: entry.label,
+        });
+        setQueueStatuses((prev) => {
+          const next = [...prev];
+          next[index] = "active";
+          return next;
+        });
+
+        // Per-page skip sets: these exist to terminate the loop on one page, so
+        // carrying them across pages would only bloat every scan message.
+        failedPostIdsRef.current = new Set();
+        handledThisRunRef.current = new Set();
+
+        logger.always(
+          `[${index + 1}/${queue.length}] ${entry.label} — ${entry.url}`,
+        );
+
+        try {
+          await navigateTab(tab.id, entry.url);
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : String(error);
+          logger.error(`Could not open ${entry.url}: ${message}`);
+          setQueueStatuses((prev) => {
+            const next = [...prev];
+            next[index] = "failed";
+            return next;
+          });
+          continue;
+        }
+
+        if (!shouldContinueProcessingRef.current) break;
+
+        const outcome = await runCurrentPage(false);
+        setQueueStatuses((prev) => {
+          const next = [...prev];
+          next[index] = outcome === "stopped" ? "pending" : "done";
+          return next;
+        });
+
+        if (outcome === "stopped") break;
+
+        // Breathe between sites so Reddit doesn't see a burst of navigations.
+        if (index < queue.length - 1) {
+          await sleep(Math.max(1000, requestDelayMs));
+        }
+      }
+
+      await finish(
+        shouldContinueProcessingRef.current
+          ? "Queue finished."
+          : "Processing stopped by user",
+      );
     } catch (error) {
       logger.error("Failed to start mass scraping:", error);
       shouldContinueProcessingRef.current = false;
+      await flushProcessedPostIds();
+      setQueueProgress(null);
       stopScraping();
     }
   };
@@ -1357,6 +1598,18 @@ function SidebarApp() {
         </div>
       </Form>
 
+      <div className="mb-3">
+        <UrlQueueInput
+          value={urlQueueInput}
+          onChange={(value) => {
+            setUrlQueueInput(value);
+            debouncedSaveUrlQueue(value);
+          }}
+          statuses={queueStatuses}
+          disabled={scrapingStatus.isScraping}
+        />
+      </div>
+
       <div className="space-y-3">
         {!scrapingStatus.isScraping ? (
           <Button onClick={handleMassScrape} className="w-full">
@@ -1376,7 +1629,9 @@ function SidebarApp() {
         <p className="text-center text-xs text-gray-500 dark:text-gray-400">
           {scrapingStatus.isScraping
             ? "Auto-scrolling and downloading media posts..."
-            : "This will scroll and download all media on the page"}
+            : queueStatuses.length > 0 || urlQueueInput.trim()
+              ? "This will visit each page in the list and download it"
+              : "This will scroll and download all media on the page"}
         </p>
         {!scrapingStatus.isScraping && (
           <div className="space-y-3 pl-1">
@@ -1422,6 +1677,12 @@ function SidebarApp() {
         {/* Progress Display */}
         {scrapingStatus.isScraping && (
           <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded p-3">
+            {queueProgress && (
+              <p className="mb-2 text-xs font-medium text-blue-800 dark:text-blue-200 break-all">
+                Page {queueProgress.index} of {queueProgress.total}:{" "}
+                {queueProgress.label}
+              </p>
+            )}
             <div className="flex justify-between items-center mb-2">
               <span className="text-sm font-medium text-blue-800 dark:text-blue-200">
                 Progress: {scrapingStatus.downloadedCount}/

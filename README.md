@@ -40,6 +40,35 @@ https://github.com/user-attachments/assets/4295d7c0-3b2f-450c-9ec5-53dab86b150d
 2. Configure download settings
 3. Click "Start Mass Download"
 
+Downloads the page you're on, scrolling to pull in more until the listing runs
+out.
+
+### Downloading several pages in one go
+
+Put a list in **Pages to download** in the sidebar, one per line, and Firefox
+visits each in turn — downloading one completely before moving to the next.
+
+```
+r/pics
+r/aww/top/?t=month
+https://old.reddit.com/r/woodworking/
+u/someone
+# blank lines and comments are ignored
+```
+
+Accepted per line: a full Reddit URL, `r/subreddit` (with an optional sort, e.g.
+`r/pics/top/?t=all`), `u/username`, or a bare subreddit name. Bullets, numbering
+and surrounding quotes are tolerated, duplicates are collapsed, and anything
+unusable is listed under the box before the run starts rather than failing
+halfway through.
+
+An `old.reddit.com` URL is kept as-is, so you can force the old layout for a
+particular entry. Leave the box empty to download the current page as before.
+
+Already-downloaded posts are skipped across the whole list, so re-running a
+queue only picks up what's new. "Scroll up from current post" doesn't apply to
+a queue — each page opens at the top — and is ignored.
+
 ### Settings
 
 - **Download Folder**: Where files are saved (supports `{subreddit}`, `{date}`, `{user}`, `{title}`)

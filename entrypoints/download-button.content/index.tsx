@@ -129,6 +129,64 @@ const scrollToLoadMore = (scrollUp: boolean) => {
   }
 };
 
+/**
+ * How many post elements the current layout has on the page. Used to tell
+ * "Reddit loaded more" from "there is nothing left", which is what lets a
+ * mass download finish instead of scrolling at the bottom forever.
+ */
+const countPostRoots = (): number => {
+  if (isOldReddit()) return getOldRedditPosts().length;
+  if (isSearchResultsPage()) return getSearchResultRoots().length;
+  return document.querySelectorAll("shreddit-post").length;
+};
+
+/** Longest we wait for Reddit to append more posts after scrolling. */
+const LOAD_MORE_TIMEOUT_MS = 6000;
+const LOAD_MORE_POLL_MS = 400;
+
+/**
+ * Scroll, then wait for the page to actually grow.
+ *
+ * The old version scrolled and slept a flat 2s, reporting only `success: true`
+ * — so the caller could never distinguish "more posts arrived" from "we are at
+ * the end of the listing", and the scroll-down loop had no terminal state. It
+ * now polls for new posts and reports what happened, returning as soon as
+ * something loads rather than always paying the full wait.
+ */
+const scrollAndWaitForMore = async (scrollUp: boolean) => {
+  const postsBefore = countPostRoots();
+  const heightBefore = document.body.scrollHeight;
+
+  scrollToLoadMore(scrollUp);
+
+  const deadline = Date.now() + LOAD_MORE_TIMEOUT_MS;
+  let postsAfter = postsBefore;
+  let heightAfter = heightBefore;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, LOAD_MORE_POLL_MS));
+    postsAfter = countPostRoots();
+    heightAfter = document.body.scrollHeight;
+    if (postsAfter > postsBefore) break;
+  }
+
+  // Within a post of the bottom, allowing for sub-pixel zoom rounding.
+  const atBottom =
+    window.innerHeight + window.scrollY >= document.body.scrollHeight - 2;
+
+  const result = {
+    success: true,
+    grew: postsAfter > postsBefore || heightAfter > heightBefore,
+    postsBefore,
+    postsAfter,
+    heightBefore,
+    heightAfter,
+    atBottom,
+  };
+  logger.log("Scroll result:", result);
+  return result;
+};
+
 const isPostInDateRange = (
   post: Element,
   startTimestamp?: string,
@@ -1016,12 +1074,20 @@ export default defineContentScript({
     // Handle scroll to load more posts
     onMessage("SCROLL_TO_LOAD_MORE", async ({ data }) => {
       const { scrollUp = false } = data ?? {};
-      scrollToLoadMore(scrollUp);
-
-      // Wait a bit for content to load
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-
-      return { success: true };
+      return await scrollAndWaitForMore(scrollUp);
     });
+
+    // Lets the sidebar confirm the content script is live on a freshly
+    // navigated page before it starts scanning.
+    onMessage("PING", async () => ({
+      success: true,
+      url: window.location.href,
+      posts: countPostRoots(),
+      layout: isOldReddit()
+        ? ("old-reddit" as const)
+        : isSearchResultsPage()
+          ? ("search" as const)
+          : ("feed" as const),
+    }));
   },
 });

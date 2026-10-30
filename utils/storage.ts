@@ -140,6 +140,12 @@ export const savePostArchive = storage.defineItem("local:savePostArchive", {
   fallback: false,
 });
 
+// The mass-download URL queue, stored as the raw textarea text so the user's
+// own formatting and comments survive closing the sidebar.
+export const urlQueueText = storage.defineItem("local:urlQueueText", {
+  fallback: "",
+});
+
 // Verbose console logging in production builds. Without this the logger is a
 // no-op outside dev builds, so an installed extension can't say why it skipped
 // a post.
