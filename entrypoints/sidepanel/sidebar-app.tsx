@@ -33,6 +33,7 @@ import {
 import {
   formatDiagnosticsReport,
   isFailure,
+  isRoutine,
   permalinkForPostId,
   type PostDiagnostic,
 } from "@/utils/diagnostics";
@@ -513,17 +514,44 @@ function SidebarApp() {
   const [diagnosticsCount, setDiagnosticsCount] = useState(0);
   const [isSavingReport, setIsSavingReport] = useState(false);
 
-  const DIAGNOSTICS_LIMIT = 5000;
+  /**
+   * Separate budgets, for the reason given on DiagnosticsCollector: a shared
+   * cap let a feed full of already-processed posts squeeze out the download
+   * failures the report is actually for.
+   */
+  const PROBLEM_LIMIT = 5000;
+  const ROUTINE_LIMIT = 200;
+  const routineStoredRef = useRef(0);
+  const problemStoredRef = useRef(0);
+  /**
+   * Counts per reason across the whole run, including skips that were counted
+   * but not individually recorded, so the report's summary is complete even
+   * when the per-record budgets are full.
+   */
+  const reasonCountsRef = useRef<Record<string, number>>({});
+
+  const countReasons = (tally: Record<string, number>) => {
+    for (const [reason, count] of Object.entries(tally)) {
+      reasonCountsRef.current[reason] =
+        (reasonCountsRef.current[reason] ?? 0) + count;
+    }
+  };
 
   const pushDiagnostics = (records: PostDiagnostic[]) => {
     if (records.length === 0) return;
     let added = 0;
     for (const record of records) {
-      if (diagnosticsRef.current.length >= DIAGNOSTICS_LIMIT) break;
+      const routine = !isFailure(record.reason) && isRoutine(record.reason);
+      if (routine && routineStoredRef.current >= ROUTINE_LIMIT) continue;
+      if (!routine && problemStoredRef.current >= PROBLEM_LIMIT) continue;
+
       const key = `${record.postId}|${record.reason}`;
       if (seenDiagnosticsRef.current.has(key)) continue;
       seenDiagnosticsRef.current.add(key);
+
       diagnosticsRef.current.push(record);
+      if (routine) routineStoredRef.current += 1;
+      else problemStoredRef.current += 1;
       added += 1;
     }
     if (added > 0) setDiagnosticsCount(diagnosticsRef.current.length);
@@ -571,6 +599,9 @@ function SidebarApp() {
       handledThisRunRef.current = new Set();
       diagnosticsRef.current = [];
       seenDiagnosticsRef.current = new Set();
+      routineStoredRef.current = 0;
+      problemStoredRef.current = 0;
+      reasonCountsRef.current = {};
       downloadedCountRef.current = 0;
       runStartedAtRef.current = Date.now();
       setDiagnosticsCount(0);
@@ -637,7 +668,13 @@ function SidebarApp() {
         // Posts the content script examined but never queued, with reasons.
         const scanSkips = response.data.skipped ?? [];
         pushDiagnostics(scanSkips);
-        addScanTotals(scanSkips.length, response.data.examined ?? 0);
+        const scanTally = response.data.skipTally ?? {};
+        countReasons(scanTally);
+        // The tally covers skips that were counted but not recorded, so it is
+        // the true total; fall back to the record count if it's absent.
+        const tallied = Object.values(scanTally).reduce((sum, n) => sum + n, 0);
+        const scanSkipTotal = tallied > 0 ? tallied : scanSkips.length;
+        addScanTotals(scanSkipTotal, response.data.examined ?? 0);
 
         // Mark every scanned post as handled this run so it isn't re-scanned on
         // the next cycle (needed for loop termination when force download
@@ -665,6 +702,7 @@ function SidebarApp() {
           await addProcessedPostIds(
             skippedByFilter.map((item) => item.mediaPostId),
           );
+          countReasons({ "media-type-filtered": skippedByFilter.length });
           pushDiagnostics(
             skippedByFilter.map((item) => ({
               postId: item.mediaPostId,
@@ -790,6 +828,7 @@ function SidebarApp() {
               );
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
               recordFailure(mediaItem.mediaPostId, reason);
+              countReasons({ [reason]: 1 });
               pushDiagnostics([
                 {
                   postId: mediaItem.mediaPostId,
@@ -822,6 +861,7 @@ function SidebarApp() {
             );
             failedPostIdsRef.current.add(mediaItem.mediaPostId);
             recordFailure(mediaItem.mediaPostId, "download-threw");
+            countReasons({ "download-threw": 1 });
             pushDiagnostics([
               {
                 postId: mediaItem.mediaPostId,
@@ -1030,6 +1070,8 @@ function SidebarApp() {
         url: currentUrl,
         startedAt: runStartedAtRef.current ?? undefined,
         finishedAt: Date.now(),
+        counts: reasonCountsRef.current,
+        downloaded: downloadedCountRef.current,
       });
       url = createTextFileUrl(report, "text/plain;charset=utf-8");
       const stamp = new Date()

@@ -17,6 +17,12 @@ export interface ScanPageMediaMessage {
     }[];
     /** Every post the scan looked at and did not turn into a candidate. */
     skipped?: PostDiagnostic[];
+    /**
+     * Counts per reason for ALL skips this scan, including the routine ones
+     * that were counted but not individually recorded. Keeps the report's
+     * summary honest about what happened.
+     */
+    skipTally?: Record<string, number>;
     /** How many post elements were examined in this pass. */
     examined?: number;
   };

@@ -58,6 +58,14 @@ export const labelForUrl = (url: string): string => {
     const segments = parsed.pathname.split("/").filter(Boolean);
     const host = parsed.hostname === "old.reddit.com" ? " (old)" : "";
 
+    // Post permalinks first, since a full one is also an /r/<sub>/… path.
+    // These turn up when a diagnostics report's retry list is pasted back in.
+    if (segments[0] === "comments" && segments[1]) {
+      return `post ${segments[1]}${host}`;
+    }
+    if (segments[0] === "r" && segments[2] === "comments" && segments[3]) {
+      return `post ${segments[3]} in r/${segments[1]}${host}`;
+    }
     if (segments[0] === "r" && segments[1]) {
       const sort = segments[2] ? ` · ${segments[2]}` : "";
       return `r/${segments[1]}${sort}${host}`;

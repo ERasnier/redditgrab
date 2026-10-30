@@ -589,6 +589,7 @@ const scanApiResolvedPosts = async (
       totalPosts: mediaCount,
       mediaUrls,
       skipped: diagnostics.all,
+      skipTally: diagnostics.tally(),
       examined: roots.length,
     },
   };
@@ -1000,6 +1001,7 @@ export default defineContentScript({
           totalPosts: mediaCount,
           mediaUrls,
           skipped: diagnostics.all,
+          skipTally: diagnostics.tally(),
           examined: postsArray.length,
         },
       };

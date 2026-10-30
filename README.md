@@ -147,6 +147,15 @@ Then pick one:
 
 Turn on **Debug logging** in the sidebar, then run the mass download. Every post
 that is skipped or fails is logged with a reason code, and the sidebar offers
-**Save diagnostics report** — a text file listing each post, which page layout
-it came from (feed, search, or old.reddit), why it was skipped, and a permalink
-back to it.
+**Save diagnostics report**.
+
+The report leads with what needs doing something about:
+
+- **Needs attention** — every post that was meant to download and didn't, with
+  its permalink, title, reason, and which page layout it came from.
+- **Retry list** — the same posts as bare URLs, one per line. Paste it straight
+  back into **Pages to download** to retry them, or into any download manager.
+- **Summary by reason** — full counts for the whole run.
+- **Skipped posts** — a sample of the deliberate skips, for context. Routine
+  skips (already downloaded, outside the date range) are counted in the summary
+  but not listed one by one, so they can't bury the failures.

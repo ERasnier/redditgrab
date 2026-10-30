@@ -127,21 +127,36 @@ export class DiagnosticsCollector {
   private readonly records: PostDiagnostic[] = [];
   private readonly counts: Record<string, number> = {};
   private total = 0;
+  private routineStored = 0;
+  private problemStored = 0;
 
   /**
-   * @param storeRoutine keep per-post records for routine reasons too
-   * @param limit hard cap on stored records, so one pathological page can't
-   *   become the kind of unbounded growth this pass exists to remove
+   * Routine skips and real problems get separate budgets.
+   *
+   * A single shared cap looked fine until a real run came back: re-scanning an
+   * already-downloaded feed produced 498 "already-processed" records and filled
+   * the cap, so the two records that actually mattered nearly didn't make it,
+   * and on a bigger feed they would have been dropped entirely. The report
+   * exists to not lose that information, so the two kinds can no longer compete
+   * for the same space. Routine skips keep a small sample for context; their
+   * full counts always survive in the summary regardless.
+   *
+   * @param storeRoutine keep a sample of routine skips as well
+   * @param problemLimit cap on failure/non-routine records
+   * @param routineLimit cap on the routine sample
    */
   constructor(
     private readonly storeRoutine = false,
-    private readonly limit = 500,
+    private readonly problemLimit = 500,
+    private readonly routineLimit = 25,
   ) {}
 
   /** True when a full record would be stored, so callers can skip DOM work. */
   willStore(reason: SkipReason) {
-    if (this.records.length >= this.limit) return false;
-    return this.storeRoutine || !isRoutine(reason);
+    if (isRoutine(reason)) {
+      return this.storeRoutine && this.routineStored < this.routineLimit;
+    }
+    return this.problemStored < this.problemLimit;
   }
 
   add(
@@ -150,6 +165,8 @@ export class DiagnosticsCollector {
     this.total += 1;
     this.counts[entry.reason] = (this.counts[entry.reason] ?? 0) + 1;
     if (!this.willStore(entry.reason)) return;
+    if (isRoutine(entry.reason)) this.routineStored += 1;
+    else this.problemStored += 1;
     this.records.push({
       stage: "scan",
       at: Date.now(),
@@ -177,12 +194,40 @@ export class DiagnosticsCollector {
   }
 }
 
-/** Render a set of records as a plain-text report the user can read or file. */
+/**
+ * Render a set of records as a plain-text report.
+ *
+ * Ordered by what the reader has to act on, not by what happened most. A real
+ * run came back with 498 "already-processed" records around the single download
+ * failure that mattered, so the failures and their permalinks lead, followed by
+ * a bare URL list that pastes straight into "Pages to download" (or any
+ * download manager) to retry them. The routine skips are a sample at the end,
+ * for context only — their true counts are in the summary either way.
+ */
 export const formatDiagnosticsReport = (
   records: PostDiagnostic[],
-  meta: { url?: string; startedAt?: number; finishedAt?: number } = {},
+  meta: {
+    url?: string;
+    startedAt?: number;
+    finishedAt?: number;
+    /** Full counts per reason, including records that were not stored. */
+    counts?: Record<string, number>;
+    downloaded?: number;
+  } = {},
 ): string => {
   const lines: string[] = [];
+  const failures = records.filter((record) => isFailure(record.reason));
+  const skips = records.filter((record) => !isFailure(record.reason));
+
+  // Prefer the caller's full tally; fall back to counting what we kept.
+  const counts = meta.counts ?? {};
+  if (Object.keys(counts).length === 0) {
+    for (const record of records) {
+      counts[record.reason] = (counts[record.reason] ?? 0) + 1;
+    }
+  }
+  const totalSkipped = Object.values(counts).reduce((sum, n) => sum + n, 0);
+
   lines.push("RedditGrab diagnostics report");
   lines.push(`Generated: ${new Date().toISOString()}`);
   if (meta.url) lines.push(`Page: ${meta.url}`);
@@ -192,17 +237,64 @@ export const formatDiagnosticsReport = (
   if (meta.finishedAt) {
     lines.push(`Run ended: ${new Date(meta.finishedAt).toISOString()}`);
   }
+  if (meta.downloaded !== undefined) {
+    lines.push(`Downloaded: ${meta.downloaded}`);
+  }
+  lines.push(`Failed: ${failures.length}`);
+  lines.push(`Skipped: ${totalSkipped - failures.length}`);
   lines.push("");
 
-  const counts: Record<string, number> = {};
-  for (const record of records) {
-    counts[record.reason] = (counts[record.reason] ?? 0) + 1;
+  // --- 1. What needs doing something about. -------------------------------
+  lines.push("NEEDS ATTENTION");
+  lines.push("===============");
+  if (failures.length === 0) {
+    lines.push("Nothing failed. Everything below was skipped deliberately.");
+  } else {
+    lines.push(
+      `${failures.length} post(s) were meant to download and did not:`,
+    );
+    lines.push("");
+    for (const record of failures) {
+      const where = [
+        record.subreddit ? `r/${record.subreddit}` : null,
+        // Which page layout it came from: needed to tell whether one layout
+        // (old.reddit, search) fails differently from the others.
+        record.source ? `via ${record.source}` : null,
+        record.stage !== "scan" ? `at ${record.stage}` : null,
+      ]
+        .filter(Boolean)
+        .join("  ");
+      lines.push(
+        `${record.permalink ?? record.postId}${where ? `   ${where}` : ""}`,
+      );
+      if (record.title) lines.push(`    ${record.title}`);
+      lines.push(
+        `    why: ${record.reason} — ${SKIP_REASON_TEXT[record.reason] ?? ""}`,
+      );
+      if (record.detail) lines.push(`    detail: ${record.detail}`);
+      lines.push("");
+    }
+
+    // --- 2. The same posts as a bare list, ready to paste. ---------------
+    const retryable = failures
+      .map((record) => record.permalink)
+      .filter((link): link is string => Boolean(link));
+    if (retryable.length > 0) {
+      lines.push("RETRY LIST");
+      lines.push("==========");
+      lines.push(
+        'Paste into "Pages to download" in the sidebar, or into any download',
+      );
+      lines.push("manager. One post per line, nothing else on these lines:");
+      lines.push("");
+      lines.push(...retryable);
+      lines.push("");
+    }
   }
 
-  lines.push(`Posts not downloaded: ${records.length}`);
-  lines.push("");
-  lines.push("Summary by reason");
-  lines.push("-----------------");
+  // --- 3. Totals, including anything not individually recorded. ----------
+  lines.push("SUMMARY BY REASON");
+  lines.push("=================");
   const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
   if (sorted.length === 0) {
     lines.push("(nothing was skipped)");
@@ -210,26 +302,38 @@ export const formatDiagnosticsReport = (
   for (const [reason, count] of sorted) {
     const text = SKIP_REASON_TEXT[reason as SkipReason] ?? reason;
     const marker = isFailure(reason as SkipReason) ? "FAIL" : "skip";
-    lines.push(`${String(count).padStart(5)}  [${marker}] ${reason} — ${text}`);
+    lines.push(`${String(count).padStart(6)}  [${marker}] ${reason} — ${text}`);
   }
-
   lines.push("");
-  lines.push("Detail");
-  lines.push("------");
-  for (const record of records) {
-    const parts = [
-      new Date(record.at).toISOString(),
-      isFailure(record.reason) ? "FAIL" : "skip",
-      record.stage,
-      record.reason,
-      record.postId,
-    ];
-    if (record.source) parts.push(`(${record.source})`);
-    if (record.subreddit) parts.push(`r/${record.subreddit}`);
-    lines.push(parts.join("  "));
-    if (record.title) lines.push(`        title: ${record.title}`);
-    if (record.permalink) lines.push(`        link:  ${record.permalink}`);
-    if (record.detail) lines.push(`        detail: ${record.detail}`);
+
+  // --- 4. Skipped posts, as a sample. ------------------------------------
+  const skipCount = totalSkipped - failures.length;
+  lines.push("SKIPPED POSTS");
+  lines.push("=============");
+  if (skips.length === 0) {
+    lines.push("(none recorded individually)");
+  } else {
+    if (skipCount > skips.length) {
+      lines.push(
+        `Showing ${skips.length} of ${skipCount}. The rest were routine skips,`,
+      );
+      lines.push("counted above but not listed one by one.");
+    }
+    lines.push("");
+    for (const record of skips) {
+      const parts = [
+        new Date(record.at).toISOString(),
+        record.stage,
+        record.reason,
+        record.postId,
+      ];
+      if (record.source) parts.push(`(${record.source})`);
+      if (record.subreddit) parts.push(`r/${record.subreddit}`);
+      lines.push(parts.join("  "));
+      if (record.title) lines.push(`        title: ${record.title}`);
+      if (record.permalink) lines.push(`        link:  ${record.permalink}`);
+      if (record.detail) lines.push(`        detail: ${record.detail}`);
+    }
   }
 
   return lines.join("\n");
