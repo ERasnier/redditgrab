@@ -38,6 +38,7 @@ export type SkipReason =
   | "download-timed-out"
   | "download-partial"
   | "archive-unavailable"
+  | "video-processing-failed"
   | "unknown-media-type";
 
 export type PostDiagnostic = {
@@ -79,6 +80,8 @@ export const SKIP_REASON_TEXT: Record<SkipReason, string> = {
   "download-timed-out": "Download stalled before finishing",
   "download-partial": "Some files in this post downloaded, others did not",
   "archive-unavailable": "Post thread could not be loaded for archiving",
+  "video-processing-failed":
+    "ffmpeg could not assemble the video (see detail for its own message)",
   "unknown-media-type": "Media type not handled by the downloader",
 };
 
@@ -95,6 +98,7 @@ export const FAILURE_REASONS: ReadonlySet<SkipReason> = new Set<SkipReason>([
   "download-timed-out",
   "download-partial",
   "archive-unavailable",
+  "video-processing-failed",
   "unknown-media-type",
 ]);
 

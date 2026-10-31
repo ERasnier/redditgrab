@@ -47,6 +47,11 @@ function classifyFailure(message: string): SkipReason {
     return "no-media-urls";
   }
   if (lower.includes("for archiving")) return "archive-unavailable";
+  // Anything from the ffmpeg wrapper, which names the step that failed.
+  if (lower.startsWith("ffmpeg ") || lower.includes("errnoerror")) {
+    return "video-processing-failed";
+  }
+  if (lower.includes("no video data")) return "video-processing-failed";
   if (lower.includes("interrupted")) return "download-interrupted";
   if (lower.includes("stalled")) return "download-timed-out";
   if (lower.includes("images failed")) return "download-partial";

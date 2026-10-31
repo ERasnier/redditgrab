@@ -422,7 +422,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
 export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
   logger.log("Processing RedGIFs HLS with manual segment download:", m3u8Url);
 
-  const ffmpeg = await createFFmpeg();
+  const { ffmpeg, run, readOutput, terminate } = await createFFmpeg();
 
   try {
 
@@ -438,81 +438,70 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     logger.log("Found segments:", segments.length);
     logger.log("Init segment:", initSegment);
 
-    const segmentFiles = [];
-
-    // Download initialization segment if present
-    if (initSegment) {
-      const initData = await downloadSegmentWithByteRange(
-        initSegment.uri,
-        initSegment.byteRange,
-      );
-      await ffmpeg.writeFile("init.m4s", initData);
-      segmentFiles.push("init.m4s");
-    }
-
-    // Download all video segments
-    for (let i = 0; i < segments.length; i++) {
-      const segment = segments[i];
-      const segmentData = await downloadSegmentWithByteRange(
-        segment.uri,
-        segment.byteRange,
-      );
-      const filename = `segment_${i.toString().padStart(3, "0")}.m4s`;
-      await ffmpeg.writeFile(filename, segmentData);
-      segmentFiles.push(filename);
-    }
-
-    // For MP4 segments, we need to use binary concatenation, not the concat demuxer
-    // Step 1: Concatenate all segments into one file.
+    // MP4 segments need binary concatenation, not the concat demuxer.
     //
-    // This used to grow one buffer by reallocating it per segment, which for n
-    // segments allocates and orphans ~n²/2 bytes — a 120-segment RedGIF churned
-    // through gigabytes of short-lived Uint8Arrays and held three or four
-    // copies of the video at peak. Read every segment once, allocate the
-    // destination once, and drop each chunk (and its MEMFS copy) as it is
-    // copied.
-    const chunks: (Uint8Array | null)[] = [];
+    // Each segment used to be written into ffmpeg's in-memory filesystem and
+    // then read straight back out to be joined, so a copy of the whole video
+    // existed in MEMFS and another in JS before anything was transcoded. MEMFS
+    // lives in the wasm heap, and exhausting it is one of the ways a transcode
+    // dies with an unhelpful filesystem error. Segments are now joined as they
+    // download and only the finished buffer is handed to ffmpeg.
+    const parts: (Uint8Array | null)[] = [];
     let total = 0;
 
-    for (const filename of segmentFiles) {
-      const segmentData = (await ffmpeg.readFile(filename)) as Uint8Array;
-      chunks.push(segmentData);
-      total += segmentData.length;
+    const collect = async (uri: string, byteRange: string) => {
+      const data = await downloadSegmentWithByteRange(uri, byteRange);
+      parts.push(data);
+      total += data.length;
+    };
+
+    // Initialization segment first, if the playlist has one: it carries the
+    // codec headers, so the order matters.
+    if (initSegment) {
+      await collect(initSegment.uri, initSegment.byteRange);
+    }
+    for (const segment of segments) {
+      await collect(segment.uri, segment.byteRange);
     }
 
+    if (total === 0) {
+      throw new Error("RedGIFs playlist yielded no video data");
+    }
+
+    // One allocation for the destination, and each part released as it lands,
+    // rather than reallocating a growing buffer per segment (which allocated
+    // and orphaned roughly n²/2 bytes for n segments).
     const allSegments = new Uint8Array(total);
     let offset = 0;
-
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      if (!chunk) continue;
-      allSegments.set(chunk, offset);
-      offset += chunk.length;
-      chunks[i] = null;
-      try {
-        await ffmpeg.deleteFile(segmentFiles[i]);
-      } catch {}
+    for (let i = 0; i < parts.length; i++) {
+      const part = parts[i];
+      if (!part) continue;
+      allSegments.set(part, offset);
+      offset += part.length;
+      parts[i] = null;
     }
-    chunks.length = 0;
+    parts.length = 0;
 
-    // Write the concatenated segments
     await ffmpeg.writeFile("concatenated.m4s", allSegments);
 
     // Step 1: Convert concatenated segments to MKV
-    await ffmpeg.exec(["-i", "concatenated.m4s", "-c", "copy", "live.mkv"]);
+    await run(
+      ["-i", "concatenated.m4s", "-c", "copy", "live.mkv"],
+      "RedGIFs concat → mkv",
+    );
 
     // Step 2: Convert MKV to MP4
-    await ffmpeg.exec(["-i", "live.mkv", "-codec", "copy", "live.mp4"]);
+    await run(
+      ["-i", "live.mkv", "-codec", "copy", "live.mp4"],
+      "RedGIFs mkv → mp4",
+    );
 
-    // Read the final video file
-    const finalVideo = await ffmpeg.readFile("live.mp4");
+    const finalVideo = await readOutput("live.mp4", "RedGIFs mkv → mp4");
 
-    // Segment files were already deleted during concatenation above.
-    const filesToClean = ["concatenated.m4s", "live.mkv", "live.mp4"];
-    for (const file of filesToClean) {
+    for (const file of ["concatenated.m4s", "live.mkv", "live.mp4"]) {
       try {
         await ffmpeg.deleteFile(file);
-      } catch (e) {}
+      } catch {}
     }
 
     const blob = new Blob([finalVideo as BlobPart], { type: "video/mp4" });
@@ -524,7 +513,7 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     logger.error("Error processing RedGIFs HLS:", error);
     throw error;
   } finally {
-    ffmpeg.terminate();
+    terminate();
   }
 }
 
@@ -619,7 +608,7 @@ async function fetchMediaWithFallback(
 }
 
 export async function getHLSVideoUrl(m3u8Url: string) {
-  const ffmpeg = await createFFmpeg();
+  const { ffmpeg, run, readOutput, terminate } = await createFFmpeg();
 
   try {
     const [videoUrl, audioUrl] = m3u8Url.split(",");
@@ -632,30 +621,26 @@ export async function getHLSVideoUrl(m3u8Url: string) {
 
     const hasAudio = audioUrl && audioUrl.trim() !== "";
 
+    const label = hasAudio ? "HLS mux video+audio" : "HLS remux video";
+
     if (hasAudio) {
       const audioFile = await fetchMediaWithFallback(audioUrl, ".aac");
       await ffmpeg.writeFile("audio.ts", audioFile);
 
-      await ffmpeg.exec([
-        "-i",
-        "video.ts",
-        "-i",
-        "audio.ts",
-        "-c",
-        "copy",
-        "output.mp4",
-      ]);
+      await run(
+        ["-i", "video.ts", "-i", "audio.ts", "-c", "copy", "output.mp4"],
+        label,
+      );
     } else {
       logger.log("No audio URL provided, processing video only");
-      await ffmpeg.exec(["-i", "video.ts", "-c", "copy", "output.mp4"]);
+      await run(["-i", "video.ts", "-c", "copy", "output.mp4"], label);
     }
 
-    const videoData = await ffmpeg.readFile("output.mp4");
-    const buffer = new Uint8Array(videoData as unknown as ArrayBuffer);
-    const blob = new Blob([buffer], { type: "video/mp4" });
+    const videoData = await readOutput("output.mp4", label);
+    const blob = new Blob([videoData as BlobPart], { type: "video/mp4" });
     return await createBlobUrl(blob);
   } finally {
-    ffmpeg.terminate();
+    terminate();
   }
 }
 

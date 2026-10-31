@@ -1,4 +1,5 @@
 import { fetchFile } from "@ffmpeg/util";
+import { logger } from "./logger";
 
 /**
  * Add text overlay to an image
@@ -151,7 +152,7 @@ export async function addTextToVideo(
   videoBlob: Blob,
   text: string
 ): Promise<Blob> {
-  const ffmpeg = await createFFmpeg();
+  const { ffmpeg, run, readOutput, terminate } = await createFFmpeg();
 
   try {
     const videoData = new Uint8Array(await videoBlob.arrayBuffer());
@@ -233,42 +234,47 @@ export async function addTextToVideo(
       ...drawtextFilters,
     ].join(",");
 
-    await ffmpeg.exec([
-      "-i",
+    await run(
+      [
+        "-i",
+        "input.mp4",
+        "-vf",
+        filterComplex,
+        "-c:a",
+        "copy", // Copy audio without re-encoding
+        "-c:v",
+        "libx264", // Use H.264 codec
+        "-preset",
+        "ultrafast", // Fastest encoding preset
+        "-crf",
+        "28", // Lower quality for speed (18-28 range, higher = faster)
+        "-movflags",
+        "+faststart", // Optimize for web playback
+        "-threads",
+        "0", // Use all available CPU threads
+        "output.mp4",
+      ],
+      "video title overlay",
+    );
+
+    const data = await readOutput("output.mp4", "video title overlay");
+
+    for (const file of [
       "input.mp4",
-      "-vf",
-      filterComplex,
-      "-c:a",
-      "copy", // Copy audio without re-encoding
-      "-c:v",
-      "libx264", // Use H.264 codec
-      "-preset",
-      "ultrafast", // Fastest encoding preset
-      "-crf",
-      "28", // Lower quality for speed (18-28 range, higher = faster)
-      "-movflags",
-      "+faststart", // Optimize for web playback
-      "-threads",
-      "0", // Use all available CPU threads
       "output.mp4",
-    ]);
-
-    const data = await ffmpeg.readFile("output.mp4");
-
-    try {
-      await ffmpeg.deleteFile("input.mp4");
-      await ffmpeg.deleteFile("output.mp4");
-      await ffmpeg.deleteFile("OpenSans-Bold.ttf");
-      await Promise.all(
-        textLines.map((line, index) => ffmpeg.deleteFile(`temp${index}.txt`))
-      );
-    } catch (e) {}
+      "OpenSans-Bold.ttf",
+      ...textLines.map((_, index) => `temp${index}.txt`),
+    ]) {
+      try {
+        await ffmpeg.deleteFile(file);
+      } catch {}
+    }
 
     return new Blob([data as BlobPart], { type: "video/mp4" });
   } catch (error) {
-    console.error("FFmpeg video processing failed:", error);
+    logger.error("FFmpeg video processing failed:", error);
     throw error;
   } finally {
-    ffmpeg.terminate();
+    terminate();
   }
 }
