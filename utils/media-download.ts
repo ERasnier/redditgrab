@@ -563,6 +563,16 @@ async function loadHlsSegments(
     const text = await response.text();
     logger.log("playlist", url, text);
 
+    // RFC 8216 §4: a playlist MUST begin with #EXTM3U. Without this check an
+    // error page or JSON body served with status 200 parses as a single bogus
+    // "segment" — its first line taken for a URI — and the failure surfaces
+    // later as a confusing download error instead of naming the real problem.
+    if (!text.trimStart().startsWith("#EXTM3U")) {
+      throw new Error(
+        `Not an HLS playlist at ${url} — ${describePlaylist(text)}`,
+      );
+    }
+
     const playlist = parseHlsPlaylist(text, url);
 
     if (playlist.kind === "master") {
