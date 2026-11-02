@@ -2,6 +2,7 @@ import { defineConfig, WxtViteConfig } from "wxt";
 import tailwindcss from "@tailwindcss/vite";
 import wasm from "vite-plugin-wasm";
 import topLevelAwait from "vite-plugin-top-level-await";
+import { firefoxHtmlAssets } from "./build/firefox-html-assets";
 
 // See https://wxt.dev/api/config.html
 export default defineConfig({
@@ -64,7 +65,7 @@ export default defineConfig({
   }),
   vite: () =>
     ({
-      plugins: [tailwindcss(), wasm(), topLevelAwait()],
+      plugins: [tailwindcss(), wasm(), topLevelAwait(), firefoxHtmlAssets()],
       optimizeDeps: {
         exclude: ["@ffmpeg/ffmpeg", "@ffmpeg/util"],
       },
