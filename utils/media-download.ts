@@ -10,6 +10,13 @@ import {
   summariseFetchFailures,
   MediaFetchError,
 } from "./media-fetch";
+import {
+  parseHlsPlaylist,
+  pickBestVariant,
+  resolveByteRanges,
+  describePlaylist,
+  type HlsSegment,
+} from "./hls";
 import { DownloadImageOptions, DownloadVideoOptions } from "@/types";
 
 export const getRedGifsUrl = (mediaElement: Element): string | null => {
@@ -447,15 +454,9 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
   const { ffmpeg, run, readOutput, terminate } = await createFFmpeg();
 
   try {
-
-    // Download and parse the m3u8 playlist
-    const response = await fetch(m3u8Url);
-    const playlistContent = await response.text();
-
-    logger.log("playlistContent", playlistContent);
-
-    // Parse segments and init segment manually since FFmpeg.wasm doesn't support HTTPS
-    const { initSegment, segments } = parseRedGifsPlaylist(playlistContent);
+    // ffmpeg.wasm can't fetch over HTTPS, so the playlist is resolved and the
+    // segments downloaded here.
+    const { initSegment, segments } = await loadHlsSegments(m3u8Url);
 
     logger.log("Found segments:", segments.length);
     logger.log("Init segment:", initSegment);
@@ -471,8 +472,8 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     const parts: (Uint8Array | null)[] = [];
     let total = 0;
 
-    const collect = async (uri: string, byteRange: string) => {
-      const data = await downloadSegmentWithByteRange(uri, byteRange);
+    const collect = async (segment: HlsSegment) => {
+      const data = await downloadHlsSegment(segment);
       parts.push(data);
       total += data.length;
     };
@@ -480,10 +481,10 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     // Initialization segment first, if the playlist has one: it carries the
     // codec headers, so the order matters.
     if (initSegment) {
-      await collect(initSegment.uri, initSegment.byteRange);
+      await collect(initSegment);
     }
     for (const segment of segments) {
-      await collect(segment.uri, segment.byteRange);
+      await collect(segment);
     }
 
     if (total === 0) {
@@ -539,62 +540,86 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
   }
 }
 
-// Parse RedGIFs playlist to extract segments with byte ranges
-function parseRedGifsPlaylist(playlistText: string) {
-  const lines = playlistText.split("\n").map((line) => line.trim());
-  const segments = [];
-  let initSegment = null;
+/** How many times to follow a master playlist down to a media playlist. */
+const MAX_PLAYLIST_DEPTH = 3;
 
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
+/**
+ * Resolve a playlist URL to its segments, following master playlists.
+ *
+ * When this still finds nothing the error carries an excerpt of the playlist,
+ * because the alternative — "no video data" with no sight of what was actually
+ * served — is a dead end, and that is precisely how these failures presented.
+ */
+async function loadHlsSegments(
+  playlistUrl: string,
+): Promise<{ initSegment?: HlsSegment; segments: HlsSegment[] }> {
+  let url = playlistUrl;
 
-    if (line.startsWith("#EXT-X-MAP:")) {
-      // Extract initialization segment
-      const uriMatch = line.match(/URI="([^"]+)"/);
-      const byteRangeMatch = line.match(/BYTERANGE="([^"]+)"/);
-
-      if (uriMatch && byteRangeMatch) {
-        initSegment = {
-          uri: uriMatch[1],
-          byteRange: byteRangeMatch[1],
-        };
-      }
-    } else if (line.startsWith("#EXT-X-BYTERANGE:")) {
-      // Store byte range for next segment
-      const byteRange = line.replace("#EXT-X-BYTERANGE:", "");
-      if (i + 1 < lines.length && lines[i + 1].startsWith("https://")) {
-        segments.push({
-          uri: lines[i + 1],
-          byteRange: byteRange,
-        });
-        i++; // Skip the next line since we processed it
-      }
+  for (let depth = 0; depth < MAX_PLAYLIST_DEPTH; depth++) {
+    const response = await fetch(url, { credentials: "include" });
+    if (!response.ok) {
+      throw new Error(`Failed to fetch playlist ${url}: ${response.status}`);
     }
+    const text = await response.text();
+    logger.log("playlist", url, text);
+
+    const playlist = parseHlsPlaylist(text, url);
+
+    if (playlist.kind === "master") {
+      const best = pickBestVariant(playlist.variants);
+      if (!best) {
+        throw new Error(
+          `Playlist listed no usable streams — ${describePlaylist(text)}`,
+        );
+      }
+      logger.log(
+        `Following variant: ${best.height ?? "?"}p, ${best.bandwidth} bps`,
+      );
+      url = best.uri;
+      continue;
+    }
+
+    if (playlist.segments.length === 0) {
+      throw new Error(
+        `Playlist contained no segments — ${describePlaylist(text)}`,
+      );
+    }
+
+    return {
+      initSegment: playlist.initSegment,
+      segments: resolveByteRanges(playlist.segments),
+    };
   }
 
-  return { initSegment, segments };
+  throw new Error(
+    `Playlist nested more than ${MAX_PLAYLIST_DEPTH} levels deep: ${playlistUrl}`,
+  );
 }
 
-async function downloadSegmentWithByteRange(
-  url: string,
-  byteRange: string,
-): Promise<Uint8Array> {
-  const [length, offset] = byteRange.split("@").map(Number);
-  const endByte = offset + length - 1;
+/** Fetch one segment, as a byte range of a larger file or in whole. */
+async function downloadHlsSegment(segment: HlsSegment): Promise<Uint8Array> {
+  const headers: Record<string, string> = {};
+  if (segment.byteRange) {
+    const offset = segment.byteRange.offset ?? 0;
+    headers.Range = `bytes=${offset}-${offset + segment.byteRange.length - 1}`;
+  }
 
-  const response = await fetch(url, {
-    headers: {
-      Range: `bytes=${offset}-${endByte}`,
-    },
+  const response = await fetch(segment.uri, {
+    credentials: "include",
+    headers,
   });
 
   if (!response.ok) {
     throw new Error(
-      `Failed to download segment: ${response.status} ${response.statusText}`,
+      `Failed to download segment ${segment.uri}: ${response.status} ${response.statusText}`,
     );
   }
 
-  return new Uint8Array(await response.arrayBuffer());
+  const data = new Uint8Array(await response.arrayBuffer());
+  if (data.length === 0) {
+    throw new Error(`Segment ${segment.uri} was empty`);
+  }
+  return data;
 }
 
 /**

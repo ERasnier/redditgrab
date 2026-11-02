@@ -17,10 +17,30 @@ export function sanitizeForFilename(
   maxLength = 80,
 ): string {
   if (!raw) return "";
-  const cleaned = filenamify(raw, { maxLength, replacement: " " })
+
+  // filenamify's own maxLength preserves what it takes to be the extension,
+  // and it treats everything after the final dot as one. A title containing a
+  // dot therefore came back as just that tail — "there's no cute way to say
+  // this... i have an obscene amount…" became ". i have an obscene amount…":
+  // 99 characters despite a limit of 80, missing its first half, and starting
+  // with a dot. Use filenamify for character sanitising only and bound the
+  // length here, where there is no extension to misread.
+  let cleaned = filenamify(raw, { maxLength: 10_000, replacement: " " })
     .replace(/\s+/g, " ")
     .trim();
-  return cleaned;
+
+  if (cleaned.length > maxLength) {
+    cleaned = cleaned.slice(0, maxLength);
+    // Prefer not to end mid-word, but only if that keeps most of the text.
+    const lastSpace = cleaned.lastIndexOf(" ");
+    if (lastSpace > maxLength * 0.6) cleaned = cleaned.slice(0, lastSpace);
+  }
+
+  // A leading dot makes a hidden file, and Firefox's own path check strips
+  // leading dots and spaces — so a segment that has them differs from what it
+  // would sanitise to, and it rejects the whole download with "filename must
+  // not contain illegal characters".
+  return cleaned.replace(/^[.\s]+/, "").replace(/[.\s]+$/, "");
 }
 
 export function generateFilename(pattern: string, data: FilenameData): string {
@@ -46,8 +66,9 @@ export function generateFilename(pattern: string, data: FilenameData): string {
  * "complex" emoji: a ZWJ sequence like 🤷‍♀️ contains a zero-width joiner
  * (U+200D, category Cf). We strip those (and bidi marks, zero-width spaces, BOM)
  * but keep the visible emoji glyphs, which are legal. Cleans each "/" segment,
- * keeps the separators, collapses whitespace, and drops trailing dots/spaces
- * (illegal per Windows path segment).
+ * keeps the separators, collapses whitespace, and drops leading and trailing
+ * dots/spaces — Firefox strips both, and a segment that still has them does
+ * not match what it would sanitise to, so it refuses the download.
  */
 export function sanitizeDownloadPath(path: string): string {
   const segments = path
@@ -56,7 +77,8 @@ export function sanitizeDownloadPath(path: string): string {
       segment
         .replace(/[<>:"|?*\\\p{Cc}\p{Cf}]/gu, "")
         .replace(/\s+/g, " ")
-        .replace(/[ .]+$/g, "")
+        .replace(/^[ .]+/, "")
+        .replace(/[ .]+$/, "")
         .trim(),
     )
     .filter((segment) => segment.length > 0);
