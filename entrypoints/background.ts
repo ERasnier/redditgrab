@@ -119,8 +119,16 @@ async function handleDownloadRequest(data: DownloadRequestMessage) {
       filenamePattern: pattern,
     } as const satisfies Parameters<typeof downloadGalleryImages>[0];
 
-    await downloadGalleryImages(downloadGalleryImagesOptions);
+    const result = await downloadGalleryImages(downloadGalleryImagesOptions);
     await archiveAlongsideMedia();
+    // Some images landed and some didn't. Without this the post counts as a
+    // clean success and is never looked at again, so a 20-image gallery saved
+    // as 19 goes unnoticed — the exact silent loss these checks are for.
+    if (result && "partialFailures" in result) {
+      throw new Error(
+        `${result.failedCount} of ${result.total} images failed: ${result.partialFailures[0]}`,
+      );
+    }
     return;
   }
 

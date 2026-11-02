@@ -1,6 +1,15 @@
 import { debugLogging } from "./storage";
 
-const isDevelopment = import.meta.env.DEV;
+// Kept as a literal `import.meta.env.DEV` so Vite still substitutes it at
+// build time; the guard is for every other context (unit tests, plain node),
+// where `import.meta.env` doesn't exist and the bare read throws.
+const isDevelopment = (() => {
+  try {
+    return import.meta.env.DEV === true;
+  } catch {
+    return false;
+  }
+})();
 
 /**
  * Runtime debug switch.

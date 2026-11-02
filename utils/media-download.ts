@@ -5,6 +5,11 @@ import {
   downloadAndRelease,
   revokeIfObjectUrl,
 } from "./blob-utils";
+import {
+  fetchMediaBlob,
+  summariseFetchFailures,
+  MediaFetchError,
+} from "./media-fetch";
 import { DownloadImageOptions, DownloadVideoOptions } from "@/types";
 
 export const getRedGifsUrl = (mediaElement: Element): string | null => {
@@ -166,33 +171,41 @@ function extensionFromContentType(contentType: string | null): string | null {
   return null;
 }
 
-async function fetchMediaBlob(url: string) {
-  const response = await fetch(url, { mode: "no-cors" });
-  if (!response.ok && response.type !== "opaque") {
-    throw new Error(`Failed to fetch ${url}: ${response.status}`);
-  }
-  const blob = await response.blob();
-  if (blob.size === 0) {
-    throw new Error(`Empty response for ${url}`);
-  }
-  return { blob, contentType: response.headers.get("content-type") };
-}
-
 async function getRemoteFile(url: string) {
   // Prefer the full-resolution original; keep the preview as a fallback in
   // case the original isn't reachable.
   let sourceUrl = url;
   let fetched: Awaited<ReturnType<typeof fetchMediaBlob>> | undefined;
+  let fullResolutionError: unknown;
   const fullResolutionUrl = toFullResolutionUrl(url);
   if (fullResolutionUrl) {
     try {
       fetched = await fetchMediaBlob(fullResolutionUrl);
       sourceUrl = fullResolutionUrl;
     } catch (error) {
+      fullResolutionError = error;
       logger.warn("Full-resolution image unavailable, using preview:", error);
     }
   }
-  fetched ??= await fetchMediaBlob(url);
+
+  if (!fetched) {
+    try {
+      fetched = await fetchMediaBlob(url);
+    } catch (error) {
+      // Both routes failed. Reporting only the preview's status hid the fact
+      // that the original was tried at all, which made these look like a
+      // simple missing file.
+      if (fullResolutionError instanceof Error && error instanceof Error) {
+        const combined = new MediaFetchError(
+          `${error.message} (full-resolution attempt also failed: ${fullResolutionError.message})`,
+          url,
+          error instanceof MediaFetchError ? error.status : 0,
+        );
+        throw combined;
+      }
+      throw error;
+    }
+  }
 
   const header = new Uint8Array(await fetched.blob.slice(0, 16).arrayBuffer());
   const sniffed = sniffMediaType(header);
@@ -306,7 +319,7 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
   // bitmaps, 20 full-size canvases and 20 output blobs concurrently — close to
   // a gigabyte for 4000px sources. Work through them a few at a time instead.
   const CONCURRENCY = 3;
-  const failures: string[] = [];
+  const failures: unknown[] = [];
 
   for (let start = 0; start < urls.length; start += CONCURRENCY) {
     const batch = urls.slice(start, start + CONCURRENCY);
@@ -315,25 +328,34 @@ export async function downloadGalleryImages(options: DownloadImageOptions) {
     );
     for (const result of settled) {
       if (result.status === "rejected") {
-        const message =
+        logger.error(
+          "Gallery image download failed:",
           result.reason instanceof Error
             ? result.reason.message
-            : String(result.reason);
-        logger.error("Gallery image download failed:", message);
-        failures.push(message);
+            : String(result.reason),
+        );
+        failures.push(result.reason);
       }
     }
   }
 
   // One broken image shouldn't throw away the rest of the gallery; only fail
-  // the post when nothing could be saved.
+  // the post when nothing could be saved. Either way the message carries the
+  // spread of HTTP statuses: fifteen 404s and a mix of 404s and 429s have
+  // completely different causes.
   if (failures.length === urls.length) {
-    throw new Error(`all ${urls.length} image(s) failed: ${failures[0]}`);
+    throw new Error(
+      `all ${urls.length} image(s) failed: ${summariseFetchFailures(failures)}`,
+    );
   }
 
   // A partial failure used to leave a 20-image post silently saved as 19.
   if (failures.length > 0) {
-    return { partialFailures: failures, total: urls.length };
+    return {
+      partialFailures: [summariseFetchFailures(failures)],
+      total: urls.length,
+      failedCount: failures.length,
+    };
   }
 }
 
