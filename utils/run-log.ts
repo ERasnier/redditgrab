@@ -48,8 +48,15 @@ type RunLogState = {
  * Failures are what the log is for, and in practice number in the dozens.
  */
 const MAX_ENTRIES = 2000;
-/** Minimum gap between disk writes while a run is going. */
-const FLUSH_INTERVAL_MS = 20_000;
+/**
+ * Minimum gap between disk writes while a run is going.
+ *
+ * Each write is an entry in Firefox's downloads panel, so this is a trade
+ * against how fresh the file is. Two minutes suits reading the log after the
+ * fact rather than tailing it live; the first failure and the end of the run
+ * bypass it either way, so nothing waits on the interval to be recorded.
+ */
+const FLUSH_INTERVAL_MS = 120_000;
 
 const runLogState = storage.defineItem<RunLogState | null>(
   "local:runLogState",

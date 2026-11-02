@@ -161,8 +161,9 @@ ends without finishing — sidebar closed, Firefox restarted mid-watch — the
 sidebar offers to write that log out next time you open it.
 
 The downloads API has no append, so the file is replaced each time it's
-updated, at most every 20 seconds. Each update is one entry in Firefox's
-downloads panel.
+updated, at most every two minutes. Each update is one entry in Firefox's
+downloads panel. The first failure of a run and the end of the run are written
+immediately, so neither waits on that interval.
 
 ## Troubleshooting a download that didn't happen
 
