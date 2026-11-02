@@ -43,6 +43,12 @@ https://github.com/user-attachments/assets/4295d7c0-3b2f-450c-9ec5-53dab86b150d
 Downloads the page you're on, scrolling to pull in more until the listing runs
 out.
 
+**Keep running after the page runs out** (on by default) then leaves the run
+going: it re-checks the page every minute and downloads posts as they appear,
+until you press Stop. Turn it off if you want the run to finish by itself once
+there is nothing left. It does not apply to a URL queue, which has to move on
+to the next page.
+
 ### Downloading several pages in one go
 
 Put a list in **Pages to download** in the sidebar, one per line, and Firefox

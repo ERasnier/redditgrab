@@ -37,6 +37,17 @@ export type PageRunnerDeps = {
   foundDelayMs?: number;
   /** Pause after a scroll, letting the fetch settle. */
   scrollDelayMs?: number;
+  /**
+   * Stay on the page once the listing is exhausted, re-checking periodically
+   * for posts that appear later, until the user stops the run.
+   *
+   * This is the long-running watch a single-page download is often used for:
+   * leave it on a subreddit and it picks up new posts as they arrive. A queue
+   * cannot do this — it has to move on — so it always leaves this off.
+   */
+  keepWatching?: boolean;
+  /** How long to wait between checks while watching an exhausted page. */
+  watchIntervalMs?: number;
 };
 
 export const runPageUntilExhausted = async ({
@@ -49,8 +60,25 @@ export const runPageUntilExhausted = async ({
   emptyScrollsBeforeDone = 3,
   foundDelayMs = 2000,
   scrollDelayMs = 1500,
+  keepWatching = false,
+  watchIntervalMs = 60_000,
 }: PageRunnerDeps): Promise<PageRunOutcome> => {
   let emptyScrolls = 0;
+
+  /**
+   * The listing has nothing further. Either that ends the page, or — when
+   * watching — we idle and start looking again.
+   */
+  const exhausted = async (note: string): Promise<PageRunOutcome | null> => {
+    log(note);
+    if (!keepWatching) return "exhausted";
+    log(
+      `Watching for new posts; checking again in ${Math.round(watchIntervalMs / 1000)}s.`,
+    );
+    await sleep(watchIntervalMs);
+    emptyScrolls = 0;
+    return shouldContinue() ? null : "stopped";
+  };
 
   while (shouldContinue()) {
     const { queued } = await processBatch();
@@ -64,8 +92,9 @@ export const runPageUntilExhausted = async ({
     }
 
     if (scrollUp) {
-      log("Reached the top of the page.");
-      return "exhausted";
+      const done = await exhausted("Reached the top of the page.");
+      if (done) return done;
+      continue;
     }
 
     log("No new posts found, scrolling to load more...");
@@ -84,10 +113,11 @@ export const runPageUntilExhausted = async ({
     } else {
       emptyScrolls += 1;
       if (emptyScrolls >= emptyScrollsBeforeDone) {
-        log(
+        const done = await exhausted(
           `No further posts after ${emptyScrolls} scroll attempts; page is done.`,
         );
-        return "exhausted";
+        if (done) return done;
+        continue;
       }
     }
 

@@ -29,6 +29,7 @@ import {
   flushProcessedPostIds,
   resetProcessedPostIdCache,
   debugLogging as debugLoggingStorage,
+  keepWatching as keepWatchingStorage,
 } from "@/utils/storage";
 import {
   formatDiagnosticsReport,
@@ -274,6 +275,7 @@ function SidebarApp() {
 
   const [isClearingHistory, setIsClearingHistory] = useState(false);
   const [debugLogging, setDebugLogging] = useState(false);
+  const [keepWatching, setKeepWatching] = useState(true);
   // Raw textarea text, and the per-entry status of the run in progress.
   const [urlQueueInput, setUrlQueueInput] = useState("");
   const [queueStatuses, setQueueStatuses] = useState<QueueEntryStatus[]>([]);
@@ -308,6 +310,7 @@ function SidebarApp() {
         dateRangeEnd,
         darkMode,
         debugLoggingValue,
+        keepWatchingValue,
         urlQueueValue,
       ] = await Promise.all([
         folderDestinationStorage.getValue(),
@@ -325,10 +328,12 @@ function SidebarApp() {
         dateRangeEndStorage.getValue(),
         darkModeStorage.getValue(),
         debugLoggingStorage.getValue(),
+        keepWatchingStorage.getValue(),
         urlQueueTextStorage.getValue(),
       ]);
 
       setDebugLogging(debugLoggingValue || false);
+      setKeepWatching(keepWatchingValue !== false);
       setUrlQueueInput(urlQueueValue || "");
 
       form.reset({
@@ -902,9 +907,10 @@ function SidebarApp() {
        * loaded, so an exhausted page can be recognised — which is also what
        * lets the URL queue know when to move on.
        */
-      const runCurrentPage = (scrollUp: boolean) =>
+      const runCurrentPage = (scrollUp: boolean, watch = false) =>
         runPageUntilExhausted({
           scrollUp,
+          keepWatching: watch,
           processBatch: () => processOneBatch(scrollUp),
           scrollForMore: async () => {
             const scroll = await sendMessage(
@@ -932,7 +938,12 @@ function SidebarApp() {
 
       // --- No queue: download the page the user is already looking at. ---
       if (queue.length === 0) {
-        const outcome = await runCurrentPage(massDownloadScrollUp);
+        if (keepWatching) {
+          logger.always(
+            "Watching this page: the run keeps going after the listing runs out, picking up new posts until you stop it.",
+          );
+        }
+        const outcome = await runCurrentPage(massDownloadScrollUp, keepWatching);
         await finish(
           outcome === "stopped"
             ? "Processing stopped by user"
@@ -1696,6 +1707,23 @@ function SidebarApp() {
               value={massDownloadMediaFilter}
               onValueChange={setMassDownloadMediaFilter}
             />
+            <div className="flex flex-row items-center space-x-2">
+              <Checkbox
+                id="keep-watching"
+                checked={keepWatching}
+                onCheckedChange={async (checked) => {
+                  const value = checked === true;
+                  setKeepWatching(value);
+                  await keepWatchingStorage.setValue(value);
+                }}
+              />
+              <label
+                htmlFor="keep-watching"
+                className="text-xs text-gray-500 dark:text-gray-400 leading-none cursor-pointer select-none"
+              >
+                Keep running after the page runs out
+              </label>
+            </div>
             <div className="flex flex-row items-center space-x-2">
               <Checkbox
                 id="debug-logging"

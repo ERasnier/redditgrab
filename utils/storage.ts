@@ -140,6 +140,14 @@ export const savePostArchive = storage.defineItem("local:savePostArchive", {
   fallback: false,
 });
 
+// Stay on the page after the listing runs out, re-checking for posts that
+// appear later, until the run is stopped by hand. This is what makes a single
+// page download a long-running watch. It does not apply to a URL queue, which
+// has to move on to the next page.
+export const keepWatching = storage.defineItem("local:keepWatching", {
+  fallback: true,
+});
+
 // The mass-download URL queue, stored as the raw textarea text so the user's
 // own formatting and comments survive closing the sidebar.
 export const urlQueueText = storage.defineItem("local:urlQueueText", {
