@@ -41,6 +41,16 @@ import {
 import { parseUrlQueue, isSameRedditPage } from "@/utils/url-queue";
 import { runPageUntilExhausted } from "@/utils/page-runner";
 import {
+  startRunLog,
+  logRunFailure,
+  finishRunLog,
+  noteDownloaded,
+  logRunNote,
+  recoverUnfinishedRunLog,
+  writeRecoveredRunLog,
+  clearRunLog,
+} from "@/utils/run-log";
+import {
   UrlQueueInput,
   type QueueEntryStatus,
 } from "@/components/url-queue-input";
@@ -362,6 +372,20 @@ function SidebarApp() {
     loadSettings();
   }, [form]);
 
+  // Surface a log left behind by a run that ended without finishing, so the
+  // record of it can still be written out instead of being silently dropped.
+  useEffect(() => {
+    recoverUnfinishedRunLog().then((saved) => {
+      if (saved) {
+        setUnfinishedRun({
+          runId: saved.runId,
+          failed: saved.failed,
+          downloaded: saved.downloaded,
+        });
+      }
+    });
+  }, []);
+
   // Watch form changes and save to storage
   useEffect(() => {
     const subscription = form.watch((value, { name }) => {
@@ -518,6 +542,12 @@ function SidebarApp() {
   const downloadedCountRef = useRef(0);
   const [diagnosticsCount, setDiagnosticsCount] = useState(0);
   const [isSavingReport, setIsSavingReport] = useState(false);
+  // A log from a run that never closed out — sidebar shut, Firefox stopped.
+  const [unfinishedRun, setUnfinishedRun] = useState<{
+    runId: string;
+    failed: number;
+    downloaded: number;
+  } | null>(null);
 
   /**
    * Separate budgets, for the reason given on DiagnosticsCollector: a shared
@@ -806,6 +836,7 @@ function SidebarApp() {
               logger.log(`Download ${i + 1} completed`);
               incrementDownloadCount();
               downloadedCountRef.current += 1;
+              void noteDownloaded(downloadedCountRef.current);
 
               // Mark this post as processed. Buffered and flushed in batches
               // instead of rewriting the whole id array per download.
@@ -834,6 +865,16 @@ function SidebarApp() {
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
               recordFailure(mediaItem.mediaPostId, reason);
               countReasons({ [reason]: 1 });
+              void logRunFailure({
+                postId: mediaItem.mediaPostId,
+                stage: "download",
+                reason,
+                detail: message,
+                title: mediaItem.postTitle,
+                subreddit: mediaItem.subredditName,
+                permalink: permalinkForPostId(mediaItem.mediaPostId),
+                at: Date.now(),
+              });
               pushDiagnostics([
                 {
                   postId: mediaItem.mediaPostId,
@@ -867,6 +908,16 @@ function SidebarApp() {
             failedPostIdsRef.current.add(mediaItem.mediaPostId);
             recordFailure(mediaItem.mediaPostId, "download-threw");
             countReasons({ "download-threw": 1 });
+            void logRunFailure({
+              postId: mediaItem.mediaPostId,
+              stage: "download",
+              reason: "download-threw",
+              detail: message,
+              title: mediaItem.postTitle,
+              subreddit: mediaItem.subredditName,
+              permalink: permalinkForPostId(mediaItem.mediaPostId),
+              at: Date.now(),
+            });
             pushDiagnostics([
               {
                 postId: mediaItem.mediaPostId,
@@ -934,6 +985,9 @@ function SidebarApp() {
         stopScraping();
         logger.always(note);
         logRunSummary();
+        // Closes the log out and makes sure the final state reaches disk,
+        // rather than relying on anyone pressing the report button.
+        await finishRunLog(note);
       };
 
       // --- No queue: download the page the user is already looking at. ---
@@ -985,6 +1039,9 @@ function SidebarApp() {
         handledThisRunRef.current = new Set();
 
         logger.always(
+          `[${index + 1}/${queue.length}] ${entry.label} — ${entry.url}`,
+        );
+        void logRunNote(
           `[${index + 1}/${queue.length}] ${entry.label} — ${entry.url}`,
         );
 
@@ -1823,6 +1880,45 @@ function SidebarApp() {
                 {scrapingStatus.lastFailure.reason}
               </p>
             )}
+          </div>
+        )}
+
+        {/* A previous run that never closed out. Its log is still in storage,
+            so it can be written to disk rather than quietly discarded. */}
+        {unfinishedRun && !scrapingStatus.isScraping && (
+          <div className="rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-900/20 p-3">
+            <p className="text-xs text-amber-800 dark:text-amber-200 mb-2">
+              A run from {unfinishedRun.runId.replace("_", " ")} didn&apos;t
+              finish ({unfinishedRun.downloaded} downloaded,{" "}
+              {unfinishedRun.failed} failed). Its log is still here.
+            </p>
+            <div className="flex gap-2">
+              <Button
+                onClick={async () => {
+                  const saved = await recoverUnfinishedRunLog();
+                  if (saved) await writeRecoveredRunLog(saved);
+                  await clearRunLog();
+                  setUnfinishedRun(null);
+                }}
+                variant="outline"
+                size="sm"
+                className="flex-1 text-xs"
+              >
+                <Icon icon="lucide:save" className="mr-1 size-3" />
+                Save it
+              </Button>
+              <Button
+                onClick={async () => {
+                  await clearRunLog();
+                  setUnfinishedRun(null);
+                }}
+                variant="ghost"
+                size="sm"
+                className="text-xs"
+              >
+                Discard
+              </Button>
+            </div>
           </div>
         )}
 

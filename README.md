@@ -149,6 +149,21 @@ Then pick one:
 - **Permanent, no signing:** run Firefox ESR, Developer Edition or Nightly and
   set `xpinstall.signatures.required` to `false` in `about:config`.
 
+## The run log
+
+Every run writes `RedditGrab/run-<timestamp>.log` next to your downloads and
+keeps it current as the run goes, so you don't have to be there at the end to
+get the record. Each failure is appended with its reason, detail and permalink,
+and the file leads with a bare retry list.
+
+Entries are also kept in extension storage the moment they happen. If a run
+ends without finishing — sidebar closed, Firefox restarted mid-watch — the
+sidebar offers to write that log out next time you open it.
+
+The downloads API has no append, so the file is replaced each time it's
+updated, at most every 20 seconds. Each update is one entry in Firefox's
+downloads panel.
+
 ## Troubleshooting a download that didn't happen
 
 Turn on **Debug logging** in the sidebar, then run the mass download. Every post

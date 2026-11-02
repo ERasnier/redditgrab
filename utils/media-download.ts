@@ -467,67 +467,44 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
     // then read straight back out to be joined, so a copy of the whole video
     // existed in MEMFS and another in JS before anything was transcoded. MEMFS
     // lives in the wasm heap, and exhausting it is one of the ways a transcode
-    // dies with an unhelpful filesystem error. Segments are now joined as they
-    // download and only the finished buffer is handed to ffmpeg.
-    const parts: (Uint8Array | null)[] = [];
-    let total = 0;
+    // dies with an unhelpful filesystem error.
+    const ordered = initSegment ? [initSegment, ...segments] : segments;
+    let assembled: Uint8Array | null = await assembleSegments(ordered);
 
-    const collect = async (segment: HlsSegment) => {
-      const data = await downloadHlsSegment(segment);
-      parts.push(data);
-      total += data.length;
-    };
-
-    // Initialization segment first, if the playlist has one: it carries the
-    // codec headers, so the order matters.
-    if (initSegment) {
-      await collect(initSegment);
-    }
-    for (const segment of segments) {
-      await collect(segment);
-    }
-
-    if (total === 0) {
+    if (assembled.length === 0) {
       throw new Error("RedGIFs playlist yielded no video data");
     }
 
-    // One allocation for the destination, and each part released as it lands,
-    // rather than reallocating a growing buffer per segment (which allocated
-    // and orphaned roughly n²/2 bytes for n segments).
-    const allSegments = new Uint8Array(total);
-    let offset = 0;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      if (!part) continue;
-      allSegments.set(part, offset);
-      offset += part.length;
-      parts[i] = null;
-    }
-    parts.length = 0;
-
-    await ffmpeg.writeFile("concatenated.m4s", allSegments);
+    await ffmpeg.writeFile("concatenated.m4s", assembled);
+    // ffmpeg has its own copy now, so this one is dead weight for the whole
+    // transcode — which is where the heap is tightest.
+    assembled = null;
 
     // Step 1: Convert concatenated segments to MKV
     await run(
       ["-i", "concatenated.m4s", "-c", "copy", "live.mkv"],
       "RedGIFs concat → mkv",
     );
+    // Consumed; drop it before the next step allocates its own output rather
+    // than holding all three files at once.
+    await deleteQuietly(ffmpeg, "concatenated.m4s");
 
     // Step 2: Convert MKV to MP4
     await run(
       ["-i", "live.mkv", "-codec", "copy", "live.mp4"],
       "RedGIFs mkv → mp4",
     );
+    await deleteQuietly(ffmpeg, "live.mkv");
 
-    const finalVideo = await readOutput("live.mp4", "RedGIFs mkv → mp4");
+    let finalVideo: Uint8Array | null = await readOutput(
+      "live.mp4",
+      "RedGIFs mkv → mp4",
+    );
+    await deleteQuietly(ffmpeg, "live.mp4");
 
-    for (const file of ["concatenated.m4s", "live.mkv", "live.mp4"]) {
-      try {
-        await ffmpeg.deleteFile(file);
-      } catch {}
-    }
-
+    // The Blob copies the bytes, so the Uint8Array is redundant afterwards.
     const blob = new Blob([finalVideo as BlobPart], { type: "video/mp4" });
+    finalVideo = null;
     const blobUrl = await createBlobUrl(blob);
 
     logger.log("RedGIFs video processed successfully:", blobUrl);
@@ -538,6 +515,81 @@ export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
   } finally {
     terminate();
   }
+}
+
+/** Delete a file from ffmpeg's filesystem, ignoring a missing one. */
+const deleteQuietly = async (
+  ffmpeg: { deleteFile: (path: string) => Promise<unknown> },
+  path: string,
+) => {
+  try {
+    await ffmpeg.deleteFile(path);
+  } catch {}
+};
+
+/**
+ * Download segments and join them into one buffer.
+ *
+ * When the playlist gives every segment's byte-range length — which is the
+ * shape RedGIFs serves — the total is known before anything is fetched, so the
+ * destination is allocated once and each segment is written straight into it
+ * and released. Otherwise the lengths only become known as the responses
+ * arrive, so the parts are held and joined at the end; each is dropped as it is
+ * copied, and the destination is still allocated exactly once rather than
+ * regrown per segment (which orphaned roughly n²/2 bytes for n segments).
+ */
+async function assembleSegments(segments: HlsSegment[]): Promise<Uint8Array> {
+  if (segments.length === 0) return new Uint8Array(0);
+
+  const knownTotal = segments.every((segment) => segment.byteRange)
+    ? segments.reduce((sum, segment) => sum + segment.byteRange!.length, 0)
+    : null;
+
+  if (knownTotal !== null) {
+    const out = new Uint8Array(knownTotal);
+    let offset = 0;
+    for (const segment of segments) {
+      const data = await downloadHlsSegment(segment);
+      if (offset + data.length > out.length) {
+        // The server sent more than the playlist promised; fall back rather
+        // than writing out of bounds.
+        logger.warn(
+          "Segment longer than its declared byte range; re-assembling without pre-allocation",
+        );
+        return assembleWithoutLengths(segments);
+      }
+      out.set(data, offset);
+      offset += data.length;
+    }
+    return offset === out.length ? out : out.subarray(0, offset);
+  }
+
+  return assembleWithoutLengths(segments);
+}
+
+async function assembleWithoutLengths(
+  segments: HlsSegment[],
+): Promise<Uint8Array> {
+  const parts: (Uint8Array | null)[] = [];
+  let total = 0;
+
+  for (const segment of segments) {
+    const data = await downloadHlsSegment(segment);
+    parts.push(data);
+    total += data.length;
+  }
+
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (!part) continue;
+    out.set(part, offset);
+    offset += part.length;
+    parts[i] = null;
+  }
+  parts.length = 0;
+  return out;
 }
 
 /** How many times to follow a master playlist down to a media playlist. */
@@ -673,16 +725,26 @@ export async function getHLSVideoUrl(m3u8Url: string) {
     logger.log("videoUrl", videoUrl);
     logger.log("audioUrl", audioUrl);
 
-    const videoFile = await fetchMediaWithFallback(videoUrl, ".ts");
+    // Each buffer is released as soon as ffmpeg has its own copy: holding both
+    // meant the video existed twice over before the mux even started.
+    let videoFile: Uint8Array | null = await fetchMediaWithFallback(
+      videoUrl,
+      ".ts",
+    );
     await ffmpeg.writeFile("video.ts", videoFile);
+    videoFile = null;
 
     const hasAudio = audioUrl && audioUrl.trim() !== "";
 
     const label = hasAudio ? "HLS mux video+audio" : "HLS remux video";
 
     if (hasAudio) {
-      const audioFile = await fetchMediaWithFallback(audioUrl, ".aac");
+      let audioFile: Uint8Array | null = await fetchMediaWithFallback(
+        audioUrl,
+        ".aac",
+      );
       await ffmpeg.writeFile("audio.ts", audioFile);
+      audioFile = null;
 
       await run(
         ["-i", "video.ts", "-i", "audio.ts", "-c", "copy", "output.mp4"],
@@ -693,8 +755,15 @@ export async function getHLSVideoUrl(m3u8Url: string) {
       await run(["-i", "video.ts", "-c", "copy", "output.mp4"], label);
     }
 
-    const videoData = await readOutput("output.mp4", label);
+    // The inputs are consumed; free them before reading the output back.
+    await deleteQuietly(ffmpeg, "video.ts");
+    if (hasAudio) await deleteQuietly(ffmpeg, "audio.ts");
+
+    let videoData: Uint8Array | null = await readOutput("output.mp4", label);
+    await deleteQuietly(ffmpeg, "output.mp4");
+
     const blob = new Blob([videoData as BlobPart], { type: "video/mp4" });
+    videoData = null;
     return await createBlobUrl(blob);
   } finally {
     terminate();

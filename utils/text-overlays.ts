@@ -155,9 +155,15 @@ export async function addTextToVideo(
   const { ffmpeg, run, readOutput, terminate } = await createFFmpeg();
 
   try {
-    const videoData = new Uint8Array(await videoBlob.arrayBuffer());
-
+    // Released as soon as ffmpeg has its own copy. The caller still holds the
+    // source blob, so keeping this too meant three copies of the video — one
+    // here, one in the blob, one in ffmpeg's filesystem — before encoding even
+    // began, and this is the re-encoding path where the heap is tightest.
+    let videoData: Uint8Array | null = new Uint8Array(
+      await videoBlob.arrayBuffer(),
+    );
     await ffmpeg.writeFile("input.mp4", videoData);
+    videoData = null;
 
     try {
       const fontResponse = await fetchFile("/OpenSans-Bold.ttf");
@@ -257,11 +263,9 @@ export async function addTextToVideo(
       "video title overlay",
     );
 
-    const data = await readOutput("output.mp4", "video title overlay");
-
+    // Drop the input before reading the output back, so both aren't resident.
     for (const file of [
       "input.mp4",
-      "output.mp4",
       "OpenSans-Bold.ttf",
       ...textLines.map((_, index) => `temp${index}.txt`),
     ]) {
@@ -270,7 +274,17 @@ export async function addTextToVideo(
       } catch {}
     }
 
-    return new Blob([data as BlobPart], { type: "video/mp4" });
+    let data: Uint8Array | null = await readOutput(
+      "output.mp4",
+      "video title overlay",
+    );
+    try {
+      await ffmpeg.deleteFile("output.mp4");
+    } catch {}
+
+    const out = new Blob([data as BlobPart], { type: "video/mp4" });
+    data = null;
+    return out;
   } catch (error) {
     logger.error("FFmpeg video processing failed:", error);
     throw error;

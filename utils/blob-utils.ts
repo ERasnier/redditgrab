@@ -117,11 +117,25 @@ function waitForDownloadToSettle(downloadId: number): Promise<TerminalState> {
  * marked processed with nothing on disk. Every download is now waited on, and a
  * failure throws.
  */
-export async function downloadAndWait(url: string, filename?: string) {
+export type DownloadOptions = {
+  /**
+   * What to do when the file already exists. The run log relies on
+   * "overwrite": the downloads API has no append, so keeping a file current
+   * means replacing it.
+   */
+  conflictAction?: "uniquify" | "overwrite" | "prompt";
+};
+
+export async function downloadAndWait(
+  url: string,
+  filename?: string,
+  { conflictAction }: DownloadOptions = {},
+) {
   const downloadId = await browser.downloads.download({
     url,
     filename,
     saveAs: false,
+    ...(conflictAction ? { conflictAction } : {}),
   });
 
   if (downloadId === undefined) {
@@ -159,9 +173,13 @@ export function revokeIfObjectUrl(url: string) {
  * their blob in memory until revoked, so without this every downloaded image
  * and video stayed resident until the extension was reloaded.
  */
-export async function downloadAndRelease(url: string, filename: string) {
+export async function downloadAndRelease(
+  url: string,
+  filename: string,
+  options: DownloadOptions = {},
+) {
   try {
-    await downloadAndWait(url, filename);
+    await downloadAndWait(url, filename, options);
   } finally {
     revokeIfObjectUrl(url);
   }
