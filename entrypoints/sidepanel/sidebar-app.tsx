@@ -30,6 +30,8 @@ import {
   resetProcessedPostIdCache,
   debugLogging as debugLoggingStorage,
   keepWatching as keepWatchingStorage,
+  freeMemoryDuringRuns as freeMemoryDuringRunsStorage,
+  clearFinishedDownloads as clearFinishedDownloadsStorage,
 } from "@/utils/storage";
 import {
   formatDiagnosticsReport,
@@ -196,6 +198,42 @@ const navigateTab = async (tabId: number, url: string) => {
   );
 };
 
+/**
+ * Reload the tab in place and wait until the fresh page can be scanned.
+ *
+ * `navigateTab` can't do this: it needs the URL to change to know the new page
+ * has arrived, and a reload keeps the URL. Instead wait to see the tab start
+ * loading, then finish, then for the new content script to answer.
+ */
+const reloadTab = async (tabId: number) => {
+  await browser.tabs.reload(tabId);
+
+  // The reload may already be under way, or (rarely) already done, by the time
+  // we look; give it a moment to show as loading rather than racing it.
+  const sawLoadingBy = Date.now() + 5_000;
+  while (Date.now() < sawLoadingBy) {
+    const tab = await browser.tabs.get(tabId).catch(() => null);
+    if (!tab) throw new Error("the tab was closed");
+    if (tab.status === "loading") break;
+    await sleep(100);
+  }
+
+  const deadline = Date.now() + NAV_LOAD_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const tab = await browser.tabs.get(tabId).catch(() => null);
+    if (!tab) throw new Error("the tab was closed");
+    if (tab.status === "complete") {
+      const pong = await waitForContentScript(tabId);
+      logger.log(`Reloaded ${pong.url} (${pong.posts} posts on screen)`);
+      return;
+    }
+    await sleep(300);
+  }
+  throw new Error(
+    `page did not finish reloading within ${NAV_LOAD_TIMEOUT_MS / 1000}s`,
+  );
+};
+
 const debouncedSaveFolder = debounce(async (value: string) => {
   await folderDestinationStorage.setValue(value);
 }, 500);
@@ -286,6 +324,17 @@ function SidebarApp() {
   const [isClearingHistory, setIsClearingHistory] = useState(false);
   const [debugLogging, setDebugLogging] = useState(false);
   const [keepWatching, setKeepWatching] = useState(true);
+  const [freeMemoryDuringRuns, setFreeMemoryDuringRuns] = useState(true);
+  const [clearFinishedDownloads, setClearFinishedDownloads] = useState(true);
+  useEffect(() => {
+    void Promise.all([
+      freeMemoryDuringRunsStorage.getValue(),
+      clearFinishedDownloadsStorage.getValue(),
+    ]).then(([freeMemory, clearDownloads]) => {
+      setFreeMemoryDuringRuns(freeMemory !== false);
+      setClearFinishedDownloads(clearDownloads !== false);
+    });
+  }, []);
   // Raw textarea text, and the per-entry status of the run in progress.
   const [urlQueueInput, setUrlQueueInput] = useState("");
   const [queueStatuses, setQueueStatuses] = useState<QueueEntryStatus[]>([]);
@@ -465,7 +514,7 @@ function SidebarApp() {
           setIsRedditPage(isReddit);
         }
       } catch (error) {
-        console.error("Failed to get current tab:", error);
+        logger.error("Failed to get current tab:", error);
         setIsRedditPage(false);
       }
     };
@@ -495,7 +544,7 @@ function SidebarApp() {
           setIsRedditPage(isReddit);
         }
       } catch (error) {
-        console.error("Failed to get activated tab:", error);
+        logger.error("Failed to get activated tab:", error);
       }
     };
 
@@ -689,9 +738,11 @@ function SidebarApp() {
           `content-script@${tab.id}`,
         );
 
+        // A summary, not the response: the full payload carried a record for
+        // every post on the page and was pretty-printed into the console on
+        // every batch, where Firefox kept it for as long as the sidebar was open.
         logger.log(
-          "Content script response:",
-          JSON.stringify(response, null, 2),
+          `Scan: ${response?.data?.examined ?? 0} examined, ${response?.data?.mediaUrls?.length ?? 0} queued, ${response?.data?.pruned ?? 0} removed from the page`,
         );
 
         if (!response.success || !response.data) {
@@ -809,7 +860,7 @@ function SidebarApp() {
                 `content-script@${tab.id}`,
               );
             } catch (error) {
-              console.warn("Failed to highlight post:", error);
+              logger.warn("Failed to highlight post:", error);
             }
 
             // Send download request to background script
@@ -850,7 +901,7 @@ function SidebarApp() {
                     `content-script@${tab.id}`,
                   );
                 } catch (e) {
-                  console.warn("Failed to mark post as visited:", e);
+                  logger.warn("Failed to mark post as visited:", e);
                 }
               }
             } else {
@@ -975,6 +1026,15 @@ function SidebarApp() {
           sleep,
           log: (message) => logger.always(message),
           emptyScrollsBeforeDone: EMPTY_SCROLLS_BEFORE_DONE,
+          // Each re-check starts from a freshly loaded page: that is what shows
+          // new posts, and what stops a watch of many hours carrying every
+          // post from the first pass.
+          refreshPage: watch
+            ? async () => {
+                logger.always("Reloading the page to check for new posts.");
+                await reloadTab(tab.id!);
+              }
+            : undefined,
         });
 
       const finish = async (note: string) => {
@@ -1166,7 +1226,7 @@ function SidebarApp() {
       // Small delay to show the loading state
       await new Promise((resolve) => setTimeout(resolve, 500));
     } catch (error) {
-      console.error("Failed to clear processed posts:", error);
+      logger.error("Failed to clear processed posts:", error);
     } finally {
       setIsClearingHistory(false);
     }
@@ -1783,6 +1843,40 @@ function SidebarApp() {
             </div>
             <div className="flex flex-row items-center space-x-2">
               <Checkbox
+                id="free-memory-during-runs"
+                checked={freeMemoryDuringRuns}
+                onCheckedChange={async (checked) => {
+                  const value = checked === true;
+                  setFreeMemoryDuringRuns(value);
+                  await freeMemoryDuringRunsStorage.setValue(value);
+                }}
+              />
+              <label
+                htmlFor="free-memory-during-runs"
+                className="text-xs text-gray-500 dark:text-gray-400 leading-none cursor-pointer select-none"
+              >
+                Remove finished posts from the page (saves memory)
+              </label>
+            </div>
+            <div className="flex flex-row items-center space-x-2">
+              <Checkbox
+                id="clear-finished-downloads"
+                checked={clearFinishedDownloads}
+                onCheckedChange={async (checked) => {
+                  const value = checked === true;
+                  setClearFinishedDownloads(value);
+                  await clearFinishedDownloadsStorage.setValue(value);
+                }}
+              />
+              <label
+                htmlFor="clear-finished-downloads"
+                className="text-xs text-gray-500 dark:text-gray-400 leading-none cursor-pointer select-none"
+              >
+                Clear saved files from Firefox's download list
+              </label>
+            </div>
+            <div className="flex flex-row items-center space-x-2">
+              <Checkbox
                 id="debug-logging"
                 checked={debugLogging}
                 onCheckedChange={async (checked) => {
@@ -1795,7 +1889,7 @@ function SidebarApp() {
                 htmlFor="debug-logging"
                 className="text-xs text-gray-500 dark:text-gray-400 leading-none cursor-pointer select-none"
               >
-                Debug logging (console)
+                Debug logging (console; leave off for long runs)
               </label>
             </div>
           </div>

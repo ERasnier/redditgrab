@@ -25,8 +25,14 @@ let pendingProcessedIds: string[] = [];
 let knownProcessedIds: Set<string> | null = null;
 let flushTimer: ReturnType<typeof setTimeout> | null = null;
 
-const PROCESSED_FLUSH_SIZE = 25;
-const PROCESSED_FLUSH_MS = 3000;
+// Every flush rewrites the whole list, and storage.onChanged then delivers both
+// the old and the new copy to every extension context that listens — the
+// background page, the sidebar and each open Reddit tab. With tens of thousands
+// of ids that was a few megabytes of copying every three seconds. Batches are
+// larger now; the end of each scan batch and the end of a run still flush, so
+// a crash loses at most a few seconds of a batch.
+const PROCESSED_FLUSH_SIZE = 50;
+const PROCESSED_FLUSH_MS = 10_000;
 
 /** Write any buffered ids to storage. Safe to call with nothing pending. */
 export const flushProcessedPostIds = async () => {
@@ -168,3 +174,22 @@ export const debugLogging = storage.defineItem("local:debugLogging", {
 export const verifyDownloads = storage.defineItem("local:verifyDownloads", {
   fallback: true,
 });
+
+// Remove posts from the Reddit page once a mass download has finished with
+// them. Reddit's feed never unloads posts, so a long run left thousands of them
+// in the tab — each with its video player, images and a mounted download
+// button — and the tab grew until Firefox, and then the whole machine, slowed
+// down. Posts are only removed once their outcome is settled and they are well
+// above the screen.
+export const freeMemoryDuringRuns = storage.defineItem(
+  "local:freeMemoryDuringRuns",
+  { fallback: true },
+);
+
+// Take finished downloads off Firefox's download list. The files stay on disk.
+// Every saved file is an entry in that list and in history, and a run of
+// thousands left Firefox carrying all of them for the rest of the session.
+export const clearFinishedDownloads = storage.defineItem(
+  "local:clearFinishedDownloads",
+  { fallback: true },
+);

@@ -25,6 +25,8 @@ export interface ScanPageMediaMessage {
     skipTally?: Record<string, number>;
     /** How many post elements were examined in this pass. */
     examined?: number;
+    /** Finished posts removed from the page this scan to free memory. */
+    pruned?: number;
   };
 }
 

@@ -24,7 +24,7 @@ export const getPostIdentifier = (post: Element): string => {
 
   if (!postTitle && !postAuthor) {
     // Last resort: use a timestamp-based ID
-    console.warn("Could not extract post title or author, using fallback ID");
+    logger.warn("Could not extract post title or author, using fallback ID");
     return `reddit-post-fallback-${Date.now()}`;
   }
 

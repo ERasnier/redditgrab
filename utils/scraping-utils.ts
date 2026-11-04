@@ -60,7 +60,7 @@ export function getSubredditNameFromContainer(container: Element): string {
     );
     return "unknown";
   } catch (error) {
-    console.error("Failed to get subreddit name from container:", error);
+    logger.error("Failed to get subreddit name from container:", error);
     return "unknown";
   }
 }

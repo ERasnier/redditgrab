@@ -169,7 +169,7 @@ export async function addTextToVideo(
       const fontResponse = await fetchFile("/OpenSans-Bold.ttf");
       await ffmpeg.writeFile("OpenSans-Bold.ttf", new Uint8Array(fontResponse));
     } catch (e) {
-      console.error("Could not load OpenSans font:", e);
+      logger.error("Could not load OpenSans font:", e);
       throw new Error("Font file required for video text overlay");
     }
 

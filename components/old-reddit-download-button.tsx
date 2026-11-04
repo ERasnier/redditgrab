@@ -84,7 +84,7 @@ const OldRedditDownloadButton = ({ post }: { post: Element }) => {
       );
 
       if (!response?.success) {
-        console.error("Download request failed:", response);
+        logger.error("Download request failed:", response);
         setStatus("failed");
         return;
       }
@@ -95,7 +95,7 @@ const OldRedditDownloadButton = ({ post }: { post: Element }) => {
       }
       setStatus("idle");
     } catch (error) {
-      console.error("Failed to send download request:", error);
+      logger.error("Failed to send download request:", error);
       setStatus("failed");
     }
   };

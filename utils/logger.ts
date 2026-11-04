@@ -38,13 +38,66 @@ export const isDebugEnabled = () => isDevelopment || runtimeDebug;
 
 const PREFIX = "[RedditGrab]";
 
+/** Longest a single logged value may be once turned into text. */
+const MAX_ARG_LENGTH = 2000;
+
+const clip = (text: string) =>
+  text.length > MAX_ARG_LENGTH
+    ? `${text.slice(0, MAX_ARG_LENGTH)}… (${text.length - MAX_ARG_LENGTH} more chars)`
+    : text;
+
+const describeElement = (el: Element) => {
+  const id = el.id ? `#${el.id}` : "";
+  const thing =
+    el.getAttribute("id") || el.getAttribute("data-fullname") || "";
+  return `<${el.tagName.toLowerCase()}${id}${thing && !id ? ` ${thing}` : ""}>`;
+};
+
+/**
+ * Turn a log argument into plain text.
+ *
+ * Firefox keeps every console message for the life of the page it was logged
+ * from, along with the live objects passed to it, so devtools can show them if
+ * opened later. The background page lives all session and a Reddit tab can sit
+ * through a run of many hours, so every DOM element, download request and scan
+ * response handed to console.log stayed reachable until the tab closed. Logging
+ * text keeps the message without keeping the object.
+ */
+const toText = (value: unknown): string => {
+  if (typeof value === "string") return clip(value);
+  if (value === null || value === undefined) return String(value);
+  if (typeof value !== "object") return String(value);
+  if (value instanceof Error) {
+    return clip(value.stack ? `${value.message}\n${value.stack}` : value.message);
+  }
+  if (typeof Element !== "undefined" && value instanceof Element) {
+    return describeElement(value);
+  }
+  try {
+    return clip(
+      JSON.stringify(value, (_key, inner) =>
+        typeof Element !== "undefined" && inner instanceof Element
+          ? describeElement(inner)
+          : inner,
+      ),
+    );
+  } catch {
+    return Object.prototype.toString.call(value);
+  }
+};
+
+const emit = (
+  write: (...args: unknown[]) => void,
+  args: unknown[],
+) => write(PREFIX, ...args.map(toText));
+
 export const logger = {
   log: (...args: unknown[]) => {
-    if (isDebugEnabled()) console.log(PREFIX, ...args);
+    if (isDebugEnabled()) emit(console.log, args);
   },
 
   warn: (...args: unknown[]) => {
-    if (isDebugEnabled()) console.warn(PREFIX, ...args);
+    if (isDebugEnabled()) emit(console.warn, args);
   },
 
   /**
@@ -52,11 +105,11 @@ export const logger = {
    * failed download turns into a silently missing file.
    */
   error: (...args: unknown[]) => {
-    console.error(PREFIX, ...args);
+    emit(console.error, args);
   },
 
   /** Logged regardless of debug mode — run summaries and other must-see lines. */
   always: (...args: unknown[]) => {
-    console.log(PREFIX, ...args);
+    emit(console.log, args);
   },
 };

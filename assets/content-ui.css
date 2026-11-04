@@ -1,0 +1,15 @@
+/*
+ * Styles for the download buttons mounted on Reddit's page.
+ *
+ * Each button lives in its own shadow root, and every shadow root gets its own
+ * copy of this stylesheet. It used to be the whole-project Tailwind build the
+ * sidebar uses — about 48KB, fetched again, copied into the page and parsed for
+ * every post. Scanning only the files the buttons are built from cuts that
+ * per-post copy to what the buttons actually use.
+ */
+@import "tailwindcss" source(none);
+@source "../components/download-button.tsx";
+@source "../components/old-reddit-download-button.tsx";
+@source "../components/ui/button.tsx";
+@source "../entrypoints/download-button.content/index.tsx";
+@import "./theme.css";

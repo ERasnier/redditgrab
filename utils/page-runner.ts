@@ -48,6 +48,22 @@ export type PageRunnerDeps = {
   keepWatching?: boolean;
   /** How long to wait between checks while watching an exhausted page. */
   watchIntervalMs?: number;
+  /**
+   * Reload the page before each re-check while watching.
+   *
+   * Re-scanning the same document never showed new posts — Reddit doesn't add
+   * them to a feed that's already loaded — and it kept every post from the
+   * first pass in the tab for the whole watch, which over hours was the bulk of
+   * the memory a run used. A reload brings new posts in and puts the tab back
+   * to its starting size.
+   */
+  refreshPage?: () => Promise<void>;
+  /**
+   * After a reload, how many scans in a row may find nothing new before the
+   * page counts as caught up. Without this every re-check scrolled the whole
+   * listing again; new posts are near the top, so a few screens are enough.
+   */
+  caughtUpAfterIdleBatches?: number;
 };
 
 export const runPageUntilExhausted = async ({
@@ -62,8 +78,14 @@ export const runPageUntilExhausted = async ({
   scrollDelayMs = 1500,
   keepWatching = false,
   watchIntervalMs = 60_000,
+  refreshPage,
+  caughtUpAfterIdleBatches = 5,
 }: PageRunnerDeps): Promise<PageRunOutcome> => {
   let emptyScrolls = 0;
+  /** True once the page has been reloaded for a re-check. */
+  let rechecking = false;
+  /** Consecutive scans since the reload that queued nothing. */
+  let idleBatches = 0;
 
   /**
    * The listing has nothing further. Either that ends the page, or — when
@@ -77,6 +99,17 @@ export const runPageUntilExhausted = async ({
     );
     await sleep(watchIntervalMs);
     emptyScrolls = 0;
+    if (!shouldContinue()) return "stopped";
+    if (refreshPage) {
+      try {
+        await refreshPage();
+        rechecking = true;
+        idleBatches = 0;
+      } catch (error) {
+        // Carry on with the page as it is rather than ending the watch.
+        log(`Could not reload the page for a re-check: ${String(error)}`);
+      }
+    }
     return shouldContinue() ? null : "stopped";
   };
 
@@ -87,8 +120,20 @@ export const runPageUntilExhausted = async ({
     if (queued > 0) {
       // Found posts; look again shortly in case more have rendered.
       emptyScrolls = 0;
+      idleBatches = 0;
       await sleep(foundDelayMs);
       continue;
+    }
+
+    if (rechecking) {
+      idleBatches += 1;
+      if (idleBatches >= caughtUpAfterIdleBatches) {
+        const done = await exhausted(
+          `Caught up: nothing new in the last ${idleBatches} scans since reloading.`,
+        );
+        if (done) return done;
+        continue;
+      }
     }
 
     if (scrollUp) {

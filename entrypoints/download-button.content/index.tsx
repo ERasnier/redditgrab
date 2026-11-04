@@ -1,4 +1,4 @@
-import "~/assets/tailwind.css";
+import "~/assets/content-ui.css";
 import ReactDOM from "react-dom/client";
 import type { MediaContentType } from "~/types";
 import DownloadButton from "@/components/download-button";
@@ -13,7 +13,9 @@ import {
   showDownloadedMarkers,
   forceDownloadProcessed,
   savePostArchive,
+  freeMemoryDuringRuns,
 } from "@/utils/storage";
+import { pruneFinishedPosts } from "@/utils/page-pruning";
 import { compact } from "es-toolkit";
 import { logger, isDebugEnabled } from "@/utils/logger";
 import { parseISO, isValid } from "date-fns";
@@ -419,6 +421,11 @@ const invalidateProcessedIdCache = () => {
   processedIdCache = null;
 };
 
+/** Replace the cache with a value storage has already handed us. */
+const setProcessedIdCache = (ids: string[] | null | undefined) => {
+  processedIdCache = Array.isArray(ids) ? new Set(ids) : null;
+};
+
 /** Add/remove the downloaded marker on every visible post/row to match storage. */
 const refreshDownloadedMarkers = async () => {
   // Off by default; when disabled, strip any badges and bail.
@@ -486,8 +493,9 @@ const scanApiResolvedPosts = async (
   // When force download is on, ignore the history so already-downloaded posts
   // get re-grabbed.
   const forceDownload = await forceDownloadProcessed.getValue();
-  const processedIds = await processedPostIds.getValue();
-  const processedSet = new Set(forceDownload ? [] : processedIds);
+  const processedSet: ReadonlySet<string> = forceDownload
+    ? new Set()
+    : await getProcessedIdSet();
   // Posts that already failed this run, so one failing post can't loop forever.
   const skipSet = new Set(skipPostIds);
 
@@ -609,16 +617,15 @@ export default defineContentScript({
   cssInjectionMode: "ui",
   async main(ctx) {
     /**
-     * Posts we've already mounted a download button onto.
+     * Posts we've already mounted a download button onto, with the handle that
+     * unmounts it.
      *
-     * This was a strong `Set`, and Reddit's feed removes post elements as they
-     * scroll out of view — so every post ever scrolled past stayed resident
-     * along with its shadow root and its mounted React root. Scrolling a few
-     * thousand posts retained a few thousand detached DOM subtrees. A WeakSet
-     * answers the same has/add questions while letting the element, and
-     * everything hanging off it, be collected once Reddit drops it.
+     * Keyed weakly so a post Reddit drops can be collected along with its shadow
+     * root and React root; a strong Set kept every post ever scrolled past. The
+     * handle is what lets a run unmount the button before it removes a finished
+     * post from the page.
      */
-    const mountedUIs = new WeakSet<Element>();
+    const mountedUIs = new WeakMap<Element, { remove: () => void }>();
 
     const getMediaContainer = (
       element: Element,
@@ -688,7 +695,7 @@ export default defineContentScript({
           });
 
           ui.mount();
-          mountedUIs.add(post);
+          mountedUIs.set(post, ui);
         }),
       );
     };
@@ -743,7 +750,7 @@ export default defineContentScript({
           });
 
           ui.mount();
-          mountedUIs.add(element);
+          mountedUIs.set(element, ui);
         }),
       );
 
@@ -755,8 +762,10 @@ export default defineContentScript({
 
     // Re-apply downloaded markers live as downloads complete (mass or single)
     // and when the show/hide setting is toggled.
-    processedPostIds.watch(() => {
-      invalidateProcessedIdCache();
+    // The watcher is handed the new list; use it rather than discarding it and
+    // reading the whole list back out of storage again.
+    processedPostIds.watch((ids) => {
+      setProcessedIdCache(ids);
       refreshDownloadedMarkers();
     });
     showDownloadedMarkers.watch(() => {
@@ -892,12 +901,18 @@ export default defineContentScript({
 
       let mediaCount = 0;
       const diagnostics = new DiagnosticsCollector(isDebugEnabled());
+      // Posts whose outcome is settled — already saved, failed this run, or
+      // outside the date range — and so safe to take off the page.
+      const settled: Element[] = [];
 
       // Get already processed post IDs from storage. When force download is on,
       // ignore the history so already-downloaded posts get re-grabbed.
       const forceDownload = await forceDownloadProcessed.getValue();
-      const processedIds = await processedPostIds.getValue();
-      const processedSet = new Set(forceDownload ? [] : processedIds);
+      // The cached set, kept current by the storage watcher, rather than a
+      // fresh copy of the whole history deserialised on every batch.
+      const processedSet: ReadonlySet<string> = forceDownload
+        ? new Set()
+        : await getProcessedIdSet();
       // Posts that already failed this run, so one failing post can't loop forever.
       const skipSet = new Set(skipPostIds);
 
@@ -941,11 +956,18 @@ export default defineContentScript({
             }
 
             // Skip if we've already processed this post
-            if (processedSet.has(uniqueId)) return note("already-processed");
-            if (skipSet.has(uniqueId)) return note("failed-earlier-this-run");
+            if (processedSet.has(uniqueId)) {
+              settled.push(post);
+              return note("already-processed");
+            }
+            if (skipSet.has(uniqueId)) {
+              settled.push(post);
+              return note("failed-earlier-this-run");
+            }
 
             // Check if post is within date range
             if (!isPostInDateRange(post, startDate, endDate)) {
+              settled.push(post);
               return note(
                 "outside-date-range",
                 getPostDatetime(post) || undefined,
@@ -995,6 +1017,22 @@ export default defineContentScript({
 
       logScanSummary("Feed scan", postsArray.length, mediaCount, diagnostics);
 
+      // Scrolling up works back towards the top, so what's finished is below
+      // the screen rather than above it; pruning there would move the page
+      // under the run. Only the downward run removes posts.
+      let pruned = 0;
+      if (!scrollUp && (await freeMemoryDuringRuns.getValue())) {
+        pruned = pruneFinishedPosts(settled, {
+          beforeRemove: (post) => {
+            mountedUIs.get(post)?.remove();
+            mountedUIs.delete(post);
+          },
+        });
+        if (pruned > 0) {
+          logger.log(`Removed ${pruned} finished post(s) from the page`);
+        }
+      }
+
       return {
         success: true,
         data: {
@@ -1003,6 +1041,7 @@ export default defineContentScript({
           skipped: diagnostics.all,
           skipTally: diagnostics.tally(),
           examined: postsArray.length,
+          pruned,
         },
       };
     });

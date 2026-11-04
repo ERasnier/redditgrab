@@ -856,7 +856,7 @@ export async function getVideoUrl(mediaElement: Element) {
 
   const packagedMedia = mediaElement.getAttribute("packaged-media-json");
   if (!packagedMedia) {
-    console.error("No packaged-media-json found, falling back to src.");
+    logger.log("No packaged-media-json found, falling back to src.");
     // Direct src (e.g. GIF or direct video from preview.redd.it – no packaged-media-json)
     if (sourceUrl) {
       return sourceUrl;
@@ -867,7 +867,7 @@ export async function getVideoUrl(mediaElement: Element) {
   const parsed = JSON.parse(packagedMedia) as RedditPackagedMedia;
   const mp4s = parsed.playbackMp4s?.permutations ?? [];
   if (!mp4s.length) {
-    console.error("No MP4 sources found.");
+    logger.error("No MP4 sources found.");
     return;
   }
 

@@ -100,10 +100,10 @@ const DownloadButton = ({
           markPostAsVisited(postElement);
         }
       } else if (downloadResponse?.success === false) {
-        console.error("Download request failed:", downloadResponse);
+        logger.error("Download request failed:", downloadResponse);
       }
     } catch (error) {
-      console.error("Failed to send download request:", error);
+      logger.error("Failed to send download request:", error);
     } finally {
       setIsDownloading(false);
     }

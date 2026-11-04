@@ -55,7 +55,9 @@ export const createFFmpeg = async (): Promise<FFmpegSession> => {
   ffmpeg.on("log", ({ message }) => {
     logLines.push(message);
     if (logLines.length > LOG_TAIL_SIZE) logLines.shift();
-    logger.log("FFmpeg:", message);
+    // Not forwarded to the console: a single transcode prints hundreds of
+    // lines, and Firefox holds every console message for the life of the
+    // background page. The tail above is what failures report.
   });
 
   await ffmpeg.load(FFMPEG_OPTIONS);

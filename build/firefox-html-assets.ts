@@ -1,4 +1,10 @@
-import type { Plugin } from "vite";
+import type { WxtViteConfig } from "wxt";
+
+// vite is WXT's dependency, not ours, so its types are reached through WXT.
+type Plugin = Extract<
+  NonNullable<WxtViteConfig["plugins"]>[number],
+  { name: string }
+>;
 
 /**
  * Make the HTML entrypoints' asset references work on a Firefox extension page.

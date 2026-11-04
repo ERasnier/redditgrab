@@ -1,5 +1,5 @@
 import { logger } from "./logger";
-import { verifyDownloads } from "./storage";
+import { clearFinishedDownloads, verifyDownloads } from "./storage";
 
 /**
  * Object URL for a blob. Firefox's background page has URL.createObjectURL, so
@@ -155,6 +155,24 @@ export async function downloadAndWait(
     );
   }
   logger.log(`Download ${downloadId} complete: ${result.filename ?? filename}`);
+  await forgetFinishedDownload(downloadId);
+}
+
+/**
+ * Take a finished download off Firefox's download list. The file stays on disk.
+ *
+ * Each saved file is an entry in the list Firefox keeps for the session and in
+ * history; a run of thousands of files left all of them there for Firefox to
+ * carry. Only completed downloads are erased — an interrupted one stays visible.
+ */
+async function forgetFinishedDownload(downloadId: number) {
+  try {
+    if (!(await clearFinishedDownloads.getValue())) return;
+    await browser.downloads.erase({ id: downloadId });
+  } catch (error) {
+    // Housekeeping only; never fail a download that succeeded over it.
+    logger.warn(`Could not clear download ${downloadId} from the list`, error);
+  }
 }
 
 /** Free an object URL's blob. No-op for regular and data URLs. */
