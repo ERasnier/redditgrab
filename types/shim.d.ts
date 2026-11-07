@@ -81,6 +81,23 @@ export interface DownloadRequestResponse {
   reason?: SkipReason;
 }
 
+/** What a Reddit tab is carrying, for the sidebar's memory panel. */
+export interface PageStats {
+  url: string;
+  posts: number;
+  /** Elements in the page document (not counting shadow roots). */
+  elements: number;
+  /** Video players and bare <video> elements. */
+  videos: number;
+  images: number;
+  /** Download buttons mounted on posts. */
+  buttons: number;
+  /** Posts this page has removed during runs. */
+  removedFromPage: number;
+  /** Posts whose media was released but which were left on the page. */
+  releasedInPlace: number;
+}
+
 declare module "webext-bridge" {
   export interface ProtocolMap {
     SCAN_PAGE_MEDIA: ProtocolWithReturn<
@@ -104,6 +121,15 @@ declare module "webext-bridge" {
       ScrollToLoadMoreResponse
     >;
     PING: ProtocolWithReturn<void, PingResponse>;
+    RELEASE_POST: ProtocolWithReturn<
+      { mediaPostId: string; remove: boolean },
+      { success: boolean; removed: boolean }
+    >;
+    GET_PAGE_STATS: ProtocolWithReturn<void, PageStats>;
+    GET_MEMORY_STATS: ProtocolWithReturn<
+      void,
+      import("@/utils/memory-stats").ExtensionMemoryStats
+    >;
     DOWNLOAD_REQUEST: ProtocolWithReturn<
       DownloadRequestMessage,
       DownloadRequestResponse

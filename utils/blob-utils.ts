@@ -1,5 +1,11 @@
 import { logger } from "./logger";
 import { clearFinishedDownloads, verifyDownloads } from "./storage";
+import {
+  noteDownloadEnded,
+  noteDownloadStarted,
+  trackBlobUrl,
+  untrackBlobUrl,
+} from "./memory-stats";
 
 /**
  * Object URL for a blob. Firefox's background page has URL.createObjectURL, so
@@ -9,7 +15,9 @@ import { clearFinishedDownloads, verifyDownloads } from "./storage";
  * must pass it to `downloadAndRelease` (or revoke it themselves).
  */
 export async function createBlobUrl(blob: Blob): Promise<string> {
-  return URL.createObjectURL(blob);
+  const url = URL.createObjectURL(blob);
+  trackBlobUrl(url, blob.size);
+  return url;
 }
 
 /** Give up after this long with no new bytes. Progress resets the clock. */
@@ -178,6 +186,7 @@ async function forgetFinishedDownload(downloadId: number) {
 /** Free an object URL's blob. No-op for regular and data URLs. */
 export function revokeIfObjectUrl(url: string) {
   if (url.startsWith("blob:")) {
+    untrackBlobUrl(url);
     try {
       URL.revokeObjectURL(url);
     } catch {
@@ -196,14 +205,19 @@ export async function downloadAndRelease(
   filename: string,
   options: DownloadOptions = {},
 ) {
+  noteDownloadStarted();
   try {
     await downloadAndWait(url, filename, options);
   } finally {
+    noteDownloadEnded();
     revokeIfObjectUrl(url);
   }
 }
 
 /** Object URL for a generated text file, such as a post archive. */
 export function createTextFileUrl(text: string, mimeType: string): string {
-  return URL.createObjectURL(new Blob([text], { type: mimeType }));
+  const blob = new Blob([text], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  trackBlobUrl(url, blob.size);
+  return url;
 }

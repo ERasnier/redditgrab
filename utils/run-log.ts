@@ -1,6 +1,6 @@
 import { storage } from "#imports";
 import { logger } from "./logger";
-import { createTextFileUrl, downloadAndRelease } from "./blob-utils";
+import { createTextFileUrl, downloadAndRelease, revokeIfObjectUrl } from "./blob-utils";
 import {
   isFailure,
   SKIP_REASON_TEXT,
@@ -218,11 +218,7 @@ const writeToDisk = async () => {
     // Keep `dirty` set so the next attempt retries; a failed log write must
     // never fail the run.
     logger.warn("Could not write the run log to disk", error);
-    if (url) {
-      try {
-        URL.revokeObjectURL(url);
-      } catch {}
-    }
+    if (url) revokeIfObjectUrl(url);
   }
 };
 

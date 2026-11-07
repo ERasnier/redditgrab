@@ -1,5 +1,6 @@
 import { FFmpeg } from "@ffmpeg/ffmpeg";
 import { logger } from "./logger";
+import { noteFfmpegEnded, noteFfmpegStarted } from "./memory-stats";
 
 import workerURL from "@ffmpeg/ffmpeg/worker?worker&url";
 
@@ -50,6 +51,8 @@ const meaningfulLines = (lines: string[]): string[] =>
 export const createFFmpeg = async (): Promise<FFmpegSession> => {
   logger.log("Creating ffmpeg");
   const ffmpeg = new FFmpeg();
+  let terminated = false;
+  noteFfmpegStarted();
 
   const logLines: string[] = [];
   ffmpeg.on("log", ({ message }) => {
@@ -60,7 +63,18 @@ export const createFFmpeg = async (): Promise<FFmpegSession> => {
     // background page. The tail above is what failures report.
   });
 
-  await ffmpeg.load(FFMPEG_OPTIONS);
+  try {
+    await ffmpeg.load(FFMPEG_OPTIONS);
+  } catch (error) {
+    // Callers only terminate a session they got back, so a failed load used to
+    // leave its worker — and the wasm heap it had started — running.
+    terminated = true;
+    noteFfmpegEnded();
+    try {
+      ffmpeg.terminate();
+    } catch {}
+    throw error;
+  }
   logger.log("Loaded ffmpeg");
 
   const logTail = () => [...logLines];
@@ -103,6 +117,12 @@ export const createFFmpeg = async (): Promise<FFmpegSession> => {
     run,
     readOutput,
     logTail,
-    terminate: () => ffmpeg.terminate(),
+    terminate: () => {
+      if (!terminated) {
+        terminated = true;
+        noteFfmpegEnded();
+      }
+      ffmpeg.terminate();
+    },
   };
 };

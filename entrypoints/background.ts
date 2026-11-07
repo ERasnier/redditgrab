@@ -1,8 +1,12 @@
 import { onMessage } from "webext-bridge/background";
 import { DownloadRequestMessage } from "@/types/shim";
 import type { SkipReason } from "@/utils/diagnostics";
+import { getExtensionMemoryStats } from "@/utils/memory-stats";
 
 export default defineBackground(() => {
+  // For the sidebar's memory panel: what the download side is holding now.
+  onMessage("GET_MEMORY_STATS", () => getExtensionMemoryStats());
+
   onMessage("DOWNLOAD_REQUEST", async ({ data }) => {
     try {
       await handleDownloadRequest(data);

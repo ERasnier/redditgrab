@@ -15,7 +15,7 @@ import {
   savePostArchive,
   freeMemoryDuringRuns,
 } from "@/utils/storage";
-import { pruneFinishedPosts } from "@/utils/page-pruning";
+import { pruneFinishedPosts, releaseMedia, removePost } from "@/utils/page-pruning";
 import { compact } from "es-toolkit";
 import { logger, isDebugEnabled } from "@/utils/logger";
 import { parseISO, isValid } from "date-fns";
@@ -825,6 +825,71 @@ export default defineContentScript({
       return { success: false };
     });
 
+    /** Posts taken off this page by the run, for the memory panel. */
+    let removedFromPage = 0;
+    /** Posts whose media was released but which stayed on the page. */
+    let releasedInPlace = 0;
+
+    const unmountButton = (post: Element) => {
+      mountedUIs.get(post)?.remove();
+      mountedUIs.delete(post);
+    };
+
+    /**
+     * A post's download has finished, successfully or not: let go of it now.
+     *
+     * Removal is per post rather than per scan, so a video stops holding memory
+     * the moment it has been saved instead of when a later scan finds it far
+     * enough up the page. When the run is scrolling up the page is left in
+     * place — removing posts there would move the page under the run — and
+     * only the post's media is released.
+     */
+    onMessage("RELEASE_POST", async ({ data }) => {
+      const { mediaPostId, remove } = data;
+      let post: Element | null = document.querySelector(
+        `[data-wxt-media-id="${mediaPostId}"]`,
+      );
+      if (!post && isSearchResultsPage()) {
+        post = findSearchRowByThingId(mediaPostId);
+      }
+      if (!post) return { success: false, removed: false };
+
+      // Only feed posts are removed: old Reddit and search rows are short,
+      // paginated, and laid out by code that may not expect rows to vanish.
+      if (remove && post.tagName === "SHREDDIT-POST") {
+        removePost(post, unmountButton);
+        removedFromPage += 1;
+        return { success: true, removed: true };
+      }
+      releaseMedia(post);
+      releasedInPlace += 1;
+      return { success: true, removed: false };
+    });
+
+    /**
+     * Counts for the sidebar's memory panel. Firefox gives extensions no way to
+     * read a tab's real memory use, so these are the things that drive it.
+     */
+    onMessage("GET_PAGE_STATS", async () => {
+      const shredditPosts = document.getElementsByTagName("shreddit-post").length;
+      const oldRedditPosts = document.querySelectorAll(".thing.link").length;
+      // Videos live inside Reddit's player shadow roots; count the players
+      // and any bare <video> elements rather than walking every shadow tree.
+      const players = document.getElementsByTagName("shreddit-player").length +
+        document.getElementsByTagName("shreddit-player-2").length;
+      const looseVideos = document.getElementsByTagName("video").length;
+      return {
+        url: location.href,
+        posts: shredditPosts || oldRedditPosts,
+        elements: document.getElementsByTagName("*").length,
+        videos: players + looseVideos,
+        images: document.images.length,
+        buttons: document.getElementsByTagName("media-downloader-button").length,
+        removedFromPage,
+        releasedInPlace,
+      };
+    });
+
     onMessage("MARK_POST_VISITED", async ({ data }) => {
       const { mediaPostId } = data;
       const post = document.querySelector(
@@ -1023,11 +1088,9 @@ export default defineContentScript({
       let pruned = 0;
       if (!scrollUp && (await freeMemoryDuringRuns.getValue())) {
         pruned = pruneFinishedPosts(settled, {
-          beforeRemove: (post) => {
-            mountedUIs.get(post)?.remove();
-            mountedUIs.delete(post);
-          },
+          beforeRemove: unmountButton,
         });
+        removedFromPage += pruned;
         if (pruned > 0) {
           logger.log(`Removed ${pruned} finished post(s) from the page`);
         }

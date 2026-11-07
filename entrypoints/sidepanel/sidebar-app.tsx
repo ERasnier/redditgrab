@@ -32,7 +32,10 @@ import {
   keepWatching as keepWatchingStorage,
   freeMemoryDuringRuns as freeMemoryDuringRunsStorage,
   clearFinishedDownloads as clearFinishedDownloadsStorage,
+  savedQueueRun as savedQueueRunStorage,
+  type SavedQueueRun,
 } from "@/utils/storage";
+import { MemoryPanel } from "@/components/memory-panel";
 import {
   formatDiagnosticsReport,
   isFailure,
@@ -325,6 +328,11 @@ function SidebarApp() {
   const [debugLogging, setDebugLogging] = useState(false);
   const [keepWatching, setKeepWatching] = useState(true);
   const [freeMemoryDuringRuns, setFreeMemoryDuringRuns] = useState(true);
+  // A page-list run that was stopped or cut short, offered for resuming.
+  const [savedQueue, setSavedQueue] = useState<SavedQueueRun | null>(null);
+  useEffect(() => {
+    void savedQueueRunStorage.getValue().then(setSavedQueue);
+  }, []);
   const [clearFinishedDownloads, setClearFinishedDownloads] = useState(true);
   useEffect(() => {
     void Promise.all([
@@ -650,7 +658,7 @@ function SidebarApp() {
   // posts would be re-scanned every cycle and never scroll/stop).
   const handledThisRunRef = useRef<Set<string>>(new Set());
 
-  const handleMassScrape = async () => {
+  const handleMassScrape = async (resume?: SavedQueueRun) => {
     try {
       const [tab] = await browser.tabs.query({
         active: true,
@@ -662,8 +670,10 @@ function SidebarApp() {
 
       // Entries are resolved up front so a typo surfaces before anything is
       // downloaded rather than halfway through a long run.
-      const { entries: queue, errors: queueErrors } =
-        parseUrlQueue(urlQueueInput);
+      const parsed = resume
+        ? { entries: resume.entries, errors: [] }
+        : parseUrlQueue(urlQueueInput);
+      const { entries: queue, errors: queueErrors } = parsed;
       if (queueErrors.length > 0) {
         logger.error(
           `Ignoring ${queueErrors.length} unusable queue line(s):`,
@@ -692,6 +702,28 @@ function SidebarApp() {
       setQueueProgress(null);
       setQueueStatuses([]);
 
+      // Read once per run; the checkbox is hidden while a run is going.
+      const freeMemory = await freeMemoryDuringRunsStorage.getValue();
+      /** Whether the page is being walked upwards right now. */
+      let scrollingUp = false;
+
+      /**
+       * Let go of a post the moment its download has finished, whether it
+       * worked or not: its video and images are released, and on a downward
+       * run the post is removed from the page. Not awaited — the next
+       * download shouldn't wait on page housekeeping.
+       */
+      const releaseFinishedPost = (mediaPostId: string) => {
+        if (!freeMemory) return;
+        void sendMessage(
+          "RELEASE_POST",
+          { mediaPostId, remove: !scrollingUp },
+          `content-script@${tab.id}`,
+        ).catch((error) =>
+          logger.warn(`Could not release post ${mediaPostId}:`, error),
+        );
+      };
+
       /**
        * Scan the page once and download whatever that scan turned up.
        * Returns how many posts were queued and attempted so the caller can
@@ -703,6 +735,7 @@ function SidebarApp() {
         queued: number;
         attempted: number;
       }> => {
+        scrollingUp = scrollUp;
         let scanPayload: {
           scrollUp?: boolean;
           anchorPostId?: string;
@@ -892,6 +925,7 @@ function SidebarApp() {
               // Mark this post as processed. Buffered and flushed in batches
               // instead of rewriting the whole id array per download.
               await addProcessedPostId(mediaItem.mediaPostId);
+              releaseFinishedPost(mediaItem.mediaPostId);
 
               if (form.getValues("markDownloadedAsVisited")) {
                 try {
@@ -914,6 +948,7 @@ function SidebarApp() {
                 permalinkForPostId(mediaItem.mediaPostId) ?? "",
               );
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
+              releaseFinishedPost(mediaItem.mediaPostId);
               recordFailure(mediaItem.mediaPostId, reason);
               countReasons({ [reason]: 1 });
               void logRunFailure({
@@ -957,6 +992,7 @@ function SidebarApp() {
               permalinkForPostId(mediaItem.mediaPostId) ?? "",
             );
             failedPostIdsRef.current.add(mediaItem.mediaPostId);
+            releaseFinishedPost(mediaItem.mediaPostId);
             recordFailure(mediaItem.mediaPostId, "download-threw");
             countReasons({ "download-threw": 1 });
             void logRunFailure({
@@ -1075,11 +1111,53 @@ function SidebarApp() {
           'Ignoring "scroll up from current post" — each queued page starts at the top.',
         );
       }
-      logger.always(`Queue: ${queue.length} page(s) to visit`);
-      setQueueStatuses(queue.map(() => "pending"));
+      // Statuses are kept here and saved on every change, so a run that is
+      // stopped, or ended by Firefox closing, can be resumed from this list.
+      // On resume, a page that was in progress or failed to open is tried
+      // again; finished pages are skipped.
+      const statuses: QueueEntryStatus[] = resume
+        ? queue.map((_, i) =>
+            resume.statuses[i] === "done" ? "done" : "pending",
+          )
+        : queue.map(() => "pending");
+      const startedAt = resume?.startedAt ?? Date.now();
+      const saveProgress = async () => {
+        const snapshot: SavedQueueRun = {
+          entries: queue.map(({ url, label }) => ({ url, label })),
+          statuses: [...statuses],
+          startedAt,
+          updatedAt: Date.now(),
+        };
+        setSavedQueue(snapshot);
+        try {
+          await savedQueueRunStorage.setValue(snapshot);
+        } catch (error) {
+          logger.warn("Could not save page-list progress", error);
+        }
+      };
+      const setStatus = async (index: number, status: QueueEntryStatus) => {
+        statuses[index] = status;
+        setQueueStatuses([...statuses]);
+        await saveProgress();
+      };
+
+      const remaining = statuses.filter((s) => s !== "done").length;
+      logger.always(
+        resume
+          ? `Resuming page list: ${remaining} of ${queue.length} page(s) left`
+          : `Queue: ${queue.length} page(s) to visit`,
+      );
+      if (resume) {
+        void logRunNote(
+          `Resumed a page list started ${new Date(startedAt).toLocaleString()}: ${remaining} of ${queue.length} left.`,
+        );
+      }
+      setQueueStatuses([...statuses]);
+      await saveProgress();
 
       for (let index = 0; index < queue.length; index++) {
         if (!shouldContinueProcessingRef.current) break;
+        if (statuses[index] === "done") continue;
 
         const entry = queue[index];
         setQueueProgress({
@@ -1087,11 +1165,7 @@ function SidebarApp() {
           total: queue.length,
           label: entry.label,
         });
-        setQueueStatuses((prev) => {
-          const next = [...prev];
-          next[index] = "active";
-          return next;
-        });
+        await setStatus(index, "active");
 
         // Per-page skip sets: these exist to terminate the loop on one page, so
         // carrying them across pages would only bloat every scan message.
@@ -1111,22 +1185,17 @@ function SidebarApp() {
           const message =
             error instanceof Error ? error.message : String(error);
           logger.error(`Could not open ${entry.url}: ${message}`);
-          setQueueStatuses((prev) => {
-            const next = [...prev];
-            next[index] = "failed";
-            return next;
-          });
+          await setStatus(index, "failed");
           continue;
         }
 
-        if (!shouldContinueProcessingRef.current) break;
+        if (!shouldContinueProcessingRef.current) {
+          await setStatus(index, "pending");
+          break;
+        }
 
         const outcome = await runCurrentPage(false);
-        setQueueStatuses((prev) => {
-          const next = [...prev];
-          next[index] = outcome === "stopped" ? "pending" : "done";
-          return next;
-        });
+        await setStatus(index, outcome === "stopped" ? "pending" : "done");
 
         if (outcome === "stopped") break;
 
@@ -1136,10 +1205,20 @@ function SidebarApp() {
         }
       }
 
+      const completed = shouldContinueProcessingRef.current;
+      // Keep the saved progress while anything is left to do — a stopped run,
+      // or pages that failed to open — so it can be resumed. A list that got
+      // all the way through is cleared.
+      if (statuses.every((status) => status === "done")) {
+        setSavedQueue(null);
+        await savedQueueRunStorage.setValue(null);
+      }
       await finish(
-        shouldContinueProcessingRef.current
-          ? "Queue finished."
-          : "Processing stopped by user",
+        completed
+          ? statuses.some((status) => status === "failed")
+            ? "Queue finished; some pages could not be opened and can be resumed."
+            : "Queue finished."
+          : "Processing stopped by user. The page list can be resumed.",
       );
     } catch (error) {
       logger.error("Failed to start mass scraping:", error);
@@ -1780,9 +1859,58 @@ function SidebarApp() {
         />
       </div>
 
+      {!scrapingStatus.isScraping &&
+        savedQueue &&
+        savedQueue.statuses.some((status) => status !== "done") && (
+          <div className="mb-3 rounded border border-orange-300 dark:border-orange-700 bg-orange-50 dark:bg-orange-900/20 p-2 space-y-2">
+            <p className="text-xs text-gray-700 dark:text-gray-300">
+              Unfinished page list from{" "}
+              {new Date(savedQueue.startedAt).toLocaleString()}:{" "}
+              {savedQueue.statuses.filter((s) => s === "done").length} of{" "}
+              {savedQueue.entries.length} pages done. Next:{" "}
+              <span className="font-medium">
+                {savedQueue.entries[
+                  savedQueue.statuses.findIndex((s) => s !== "done")
+                ]?.label ?? "—"}
+              </span>
+            </p>
+            <div className="flex gap-2">
+              <Button
+                size="sm"
+                className="flex-1"
+                onClick={async () => {
+                  const text = savedQueue.entries
+                    .map((entry) => entry.url)
+                    .join("\n");
+                  setUrlQueueInput(text);
+                  await urlQueueTextStorage.setValue(text);
+                  await handleMassScrape(savedQueue);
+                }}
+              >
+                <Icon icon="lucide:play" className="w-4 h-4" />
+                Continue
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={async () => {
+                  setSavedQueue(null);
+                  await savedQueueRunStorage.setValue(null);
+                }}
+              >
+                Discard
+              </Button>
+            </div>
+          </div>
+        )}
+
+      <div className="mb-3">
+        <MemoryPanel />
+      </div>
+
       <div className="space-y-3">
         {!scrapingStatus.isScraping ? (
-          <Button onClick={handleMassScrape} className="w-full">
+          <Button onClick={() => handleMassScrape()} className="w-full">
             <Icon icon="lucide:download" className="w-4 h-4" />
             Start Mass Download
           </Button>

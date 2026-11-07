@@ -107,18 +107,33 @@ export const pruneFinishedPosts = (
     // Unrendered or hidden posts have an empty rect; leave them alone.
     if (rect.height === 0 || rect.bottom > limit) continue;
 
-    try {
-      beforeRemove?.(post);
-    } catch {}
-    releaseMedia(post);
-
-    const target = removalTarget(post);
-    // Reddit separates posts with <hr>; drop the one that belonged to this post
-    // so the feed doesn't fill with empty dividers.
-    const next = target.nextElementSibling;
-    if (next?.tagName === "HR") next.remove();
-    target.remove();
+    removePost(post, beforeRemove);
     removed += 1;
   }
   return removed;
+};
+
+/**
+ * Take one post off the page now, wherever it is: stop its media, run
+ * `beforeRemove` (to unmount its download button), and remove it.
+ *
+ * Used the moment a post's download finishes, so its video and images are
+ * released per post rather than whenever a later scan gets round to it.
+ */
+export const removePost = (
+  post: Element,
+  beforeRemove?: (post: Element) => void,
+) => {
+  if (!post.isConnected) return;
+  try {
+    beforeRemove?.(post);
+  } catch {}
+  releaseMedia(post);
+
+  const target = removalTarget(post);
+  // Reddit separates posts with <hr>; drop the one that belonged to this post
+  // so the feed doesn't fill with empty dividers.
+  const next = target.nextElementSibling;
+  if (next?.tagName === "HR") next.remove();
+  target.remove();
 };

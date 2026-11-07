@@ -193,3 +193,22 @@ export const clearFinishedDownloads = storage.defineItem(
   "local:clearFinishedDownloads",
   { fallback: true },
 );
+
+/**
+ * Progress through the page list, saved as the run goes so a run that was
+ * stopped — or cut short by Firefox closing — can carry on from where it got
+ * to. Pages already finished are skipped on resume; the page that was in
+ * progress starts again from the top, and posts already saved from it are
+ * skipped by the download history as usual.
+ */
+export type SavedQueueRun = {
+  entries: { url: string; label: string }[];
+  statuses: ("pending" | "active" | "done" | "failed")[];
+  startedAt: number;
+  updatedAt: number;
+};
+
+export const savedQueueRun = storage.defineItem<SavedQueueRun | null>(
+  "local:savedQueueRun",
+  { fallback: null },
+);
