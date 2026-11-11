@@ -1,5 +1,6 @@
 import { addTextToImage, addTextToVideo } from "./text-overlays";
 import { logger } from "./logger";
+import { redGifsIdFromPlaylistUrl, resolveRedGifsMp4 } from "./redgifs-api";
 import {
   createBlobUrl,
   downloadAndRelease,
@@ -388,8 +389,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
 
       if (initialUrl.includes(".m3u8")) {
         if (initialUrl.includes("api.redgifs.com")) {
-          const hlsUrl = await getRedGifsHLSVideoUrl(initialUrl);
-          return hlsUrl;
+          return await getRedGifsSourceUrl(initialUrl);
         } else {
           const hlsUrl = await getHLSVideoUrl(initialUrl);
           return hlsUrl;
@@ -447,6 +447,33 @@ export async function downloadVideo(options: DownloadVideoOptions) {
     throw err;
   }
 }
+
+/**
+ * Where to download a RedGIFs video from.
+ *
+ * The documented API comes first: one signed MP4, no ffmpeg. The HLS playlist
+ * is the fallback, so a gif the API won't serve still gets the route that has
+ * been working. When both fail, the error names both reasons, so the
+ * diagnostics show which side refused.
+ */
+const getRedGifsSourceUrl = async (playlistUrl: string): Promise<string> => {
+  const id = redGifsIdFromPlaylistUrl(playlistUrl);
+  let apiFailure = "no gif id in the URL";
+  if (id) {
+    try {
+      return await resolveRedGifsMp4(id);
+    } catch (error) {
+      apiFailure = error instanceof Error ? error.message : String(error);
+      logger.warn(`RedGIFs API failed, trying the HLS playlist: ${apiFailure}`);
+    }
+  }
+  try {
+    return await getRedGifsHLSVideoUrl(playlistUrl);
+  } catch (error) {
+    const hlsFailure = error instanceof Error ? error.message : String(error);
+    throw new Error(`${apiFailure}; HLS fallback: ${hlsFailure}`);
+  }
+};
 
 export async function getRedGifsHLSVideoUrl(m3u8Url: string): Promise<string> {
   logger.log("Processing RedGIFs HLS with manual segment download:", m3u8Url);
@@ -845,7 +872,7 @@ export async function getVideoUrl(mediaElement: Element) {
   const sourceUrl = mediaElement.getAttribute("src");
   if (sourceUrl && sourceUrl.includes(".m3u8")) {
     if (sourceUrl.includes("api.redgifs.com")) {
-      const url = await getRedGifsHLSVideoUrl(sourceUrl);
+      const url = await getRedGifsSourceUrl(sourceUrl);
       return url;
     } else {
       // Reddit HLS

@@ -155,7 +155,11 @@ export async function downloadAndWait(
 
   const result = await waitForDownloadToSettle(downloadId);
   if (result.state === "interrupted") {
-    throw new Error(`download interrupted: ${result.error}`);
+    // Name the file: FILE_FAILED and friends are about where Firefox tried to
+    // write, and without the path there is nothing to check.
+    throw new Error(
+      `download interrupted: ${result.error}${filename ? ` (saving to ${filename})` : ""}`,
+    );
   }
   if (result.state === "stalled") {
     throw new Error(
