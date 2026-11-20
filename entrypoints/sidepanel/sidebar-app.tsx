@@ -34,8 +34,12 @@ import {
   clearFinishedDownloads as clearFinishedDownloadsStorage,
   savedQueueRun as savedQueueRunStorage,
   type SavedQueueRun,
+  massDownloadMediaFilter as massDownloadMediaFilterStorage,
+  massDownloadScrollUp as massDownloadScrollUpStorage,
 } from "@/utils/storage";
 import { MemoryPanel } from "@/components/memory-panel";
+import { PresetsPanel } from "@/components/presets-panel";
+import { autoImportPresets } from "@/utils/presets";
 import {
   formatDiagnosticsReport,
   isFailure,
@@ -54,6 +58,8 @@ import {
   recoverUnfinishedRunLog,
   writeRecoveredRunLog,
   clearRunLog,
+  runLogHeartbeat,
+  recoveredEnding,
 } from "@/utils/run-log";
 import {
   UrlQueueInput,
@@ -324,6 +330,9 @@ function SidebarApp() {
     },
   });
 
+  // Bumped whenever settings change outside the form (a preset applied or
+  // imported), so everything below reloads from storage.
+  const [settingsVersion, setSettingsVersion] = useState(0);
   const [isClearingHistory, setIsClearingHistory] = useState(false);
   const [debugLogging, setDebugLogging] = useState(false);
   const [keepWatching, setKeepWatching] = useState(true);
@@ -342,7 +351,7 @@ function SidebarApp() {
       setFreeMemoryDuringRuns(freeMemory !== false);
       setClearFinishedDownloads(clearDownloads !== false);
     });
-  }, []);
+  }, [settingsVersion]);
   // Raw textarea text, and the per-entry status of the run in progress.
   const [urlQueueInput, setUrlQueueInput] = useState("");
   const [queueStatuses, setQueueStatuses] = useState<QueueEntryStatus[]>([]);
@@ -358,9 +367,33 @@ function SidebarApp() {
   const [massDownloadMediaFilter, setMassDownloadMediaFilter] =
     useState<MassDownloadMediaFilterValue>("all");
 
+  const [presetStartupNotice, setPresetStartupNotice] = useState<string | null>(null);
+  const autoImportChecked = useRef(false);
+
   // Load values from storage into form
   useEffect(() => {
     const loadSettings = async () => {
+      // Usually the background has already restored the preset file by now;
+      // checking again covers the sidebar opening first.
+      if (!autoImportChecked.current) {
+        autoImportChecked.current = true;
+        try {
+          const result = await autoImportPresets();
+          if (result.status === "imported") {
+            setPresetStartupNotice(
+              `Settings restored from the preset file exported ${new Date(result.exportedAt).toLocaleString()}.`,
+            );
+          }
+        } catch (error) {
+          logger.error("Automatic preset import failed:", error);
+        }
+      }
+      const [mediaFilterValue, scrollUpValue] = await Promise.all([
+        massDownloadMediaFilterStorage.getValue(),
+        massDownloadScrollUpStorage.getValue(),
+      ]);
+      setMassDownloadMediaFilter(mediaFilterValue ?? "all");
+      setMassDownloadScrollUp(scrollUpValue === true);
       const [
         folderDestination,
         filenamePattern,
@@ -427,7 +460,7 @@ function SidebarApp() {
     };
 
     loadSettings();
-  }, [form]);
+  }, [form, settingsVersion]);
 
   // Surface a log left behind by a run that ended without finishing, so the
   // record of it can still be written out instead of being silently dropped.
@@ -438,6 +471,7 @@ function SidebarApp() {
           runId: saved.runId,
           failed: saved.failed,
           downloaded: saved.downloaded,
+          lastSeenAt: recoveredEnding(saved).endedAt ?? saved.startedAt,
         });
       }
     });
@@ -604,7 +638,12 @@ function SidebarApp() {
     runId: string;
     failed: number;
     downloaded: number;
+    lastSeenAt: number;
   } | null>(null);
+  /** Why the current or last run ended, for the console, run log and report. */
+  const stopReasonRef = useRef<string | null>(null);
+  const runEndedAtRef = useRef<number | null>(null);
+  const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   /**
    * Separate budgets, for the reason given on DiagnosticsCollector: a shared
@@ -701,6 +740,29 @@ function SidebarApp() {
       setDiagnosticsCount(0);
       setQueueProgress(null);
       setQueueStatuses([]);
+      stopReasonRef.current = null;
+      runEndedAtRef.current = null;
+
+      // A log left by a run that never closed out would be overwritten by the
+      // new one, so write it to disk first.
+      const leftover = await recoverUnfinishedRunLog();
+      if (leftover) {
+        try {
+          await writeRecoveredRunLog(leftover);
+        } catch (error) {
+          logger.warn("Could not save the previous run's log", error);
+        }
+        setUnfinishedRun(null);
+      }
+      await startRunLog(
+        queue.length > 0
+          ? `a page list of ${queue.length} page(s), starting ${queue[0].url}`
+          : (tab.url ?? "the current tab"),
+      );
+      // A run cut short by the sidebar or Firefox closing can't write why;
+      // this shows when it was last alive.
+      if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = setInterval(() => void runLogHeartbeat(), 30_000);
 
       // Read once per run; the checkbox is hidden while a run is going.
       const freeMemory = await freeMemoryDuringRunsStorage.getValue();
@@ -1060,7 +1122,17 @@ function SidebarApp() {
           },
           shouldContinue: () => shouldContinueProcessingRef.current,
           sleep,
-          log: (message) => logger.always(message),
+          log: (message) => {
+            logger.always(message);
+            // Retries and reloads are part of why a run ends up where it
+            // does, so they go in the run's own log too.
+            if (/^(Scan failed|Could not reload|Reloading|Caught up)/.test(message)) {
+              void logRunNote(message);
+            }
+          },
+          onExhausted: (reason) => {
+            pageEndReason = reason;
+          },
           emptyScrollsBeforeDone: EMPTY_SCROLLS_BEFORE_DONE,
           // Each re-check starts from a freshly loaded page: that is what shows
           // new posts, and what stops a watch of many hours carrying every
@@ -1073,18 +1145,17 @@ function SidebarApp() {
             : undefined,
         });
 
-      const finish = async (note: string) => {
+      const finish = async (note: string, reason: string) => {
         shouldContinueProcessingRef.current = false;
-        await flushProcessedPostIds();
-        setCurrentPostInfo(null);
-        setQueueProgress(null);
-        stopScraping();
-        logger.always(note);
-        logRunSummary();
-        // Closes the log out and makes sure the final state reaches disk,
-        // rather than relying on anyone pressing the report button.
-        await finishRunLog(note);
+        await endRun(note, reason);
       };
+
+      /** Why the page in hand finished, as the runner put it. */
+      let pageEndReason = "";
+      /** Why a stop happened, falling back to saying it wasn't recorded. */
+      const stoppedReason = () =>
+        stopReasonRef.current ??
+        "The run was told to stop, but nothing recorded why.";
 
       // --- No queue: download the page the user is already looking at. ---
       if (queue.length === 0) {
@@ -1094,11 +1165,14 @@ function SidebarApp() {
           );
         }
         const outcome = await runCurrentPage(massDownloadScrollUp, keepWatching);
-        await finish(
-          outcome === "stopped"
-            ? "Processing stopped by user"
-            : "Mass download complete.",
-        );
+        if (outcome === "stopped") {
+          await finish("Processing stopped.", stoppedReason());
+        } else {
+          await finish(
+            "Mass download complete.",
+            `Finished: the page ran out of posts. ${pageEndReason}`.trim(),
+          );
+        }
         return;
       }
 
@@ -1185,6 +1259,7 @@ function SidebarApp() {
           const message =
             error instanceof Error ? error.message : String(error);
           logger.error(`Could not open ${entry.url}: ${message}`);
+          void logRunNote(`Could not open ${entry.url}: ${message}`);
           await setStatus(index, "failed");
           continue;
         }
@@ -1194,7 +1269,18 @@ function SidebarApp() {
           break;
         }
 
-        const outcome = await runCurrentPage(false);
+        let outcome: Awaited<ReturnType<typeof runCurrentPage>>;
+        try {
+          outcome = await runCurrentPage(false);
+        } catch (error) {
+          // One page going wrong shouldn't end the whole list; it's marked
+          // failed (so resuming retries it) and the run moves on.
+          const message = error instanceof Error ? error.message : String(error);
+          logger.error(`Gave up on ${entry.label}: ${message}`);
+          void logRunNote(`Gave up on ${entry.url}: ${message}`);
+          await setStatus(index, "failed");
+          continue;
+        }
         await setStatus(index, outcome === "stopped" ? "pending" : "done");
 
         if (outcome === "stopped") break;
@@ -1213,24 +1299,69 @@ function SidebarApp() {
         setSavedQueue(null);
         await savedQueueRunStorage.setValue(null);
       }
-      await finish(
-        completed
-          ? statuses.some((status) => status === "failed")
-            ? "Queue finished; some pages could not be opened and can be resumed."
-            : "Queue finished."
-          : "Processing stopped by user. The page list can be resumed.",
-      );
+      const doneCount = statuses.filter((status) => status === "done").length;
+      const failedCount = statuses.filter((status) => status === "failed").length;
+      if (completed) {
+        await finish(
+          failedCount > 0
+            ? "Queue finished; some pages could not be finished and can be resumed."
+            : "Queue finished.",
+          `Finished the page list: ${doneCount} of ${queue.length} page(s) done` +
+            (failedCount > 0 ? `, ${failedCount} failed (see the log for why)` : "") +
+            ".",
+        );
+      } else {
+        await finish(
+          "Processing stopped. The page list can be resumed.",
+          `${stoppedReason()} ${doneCount} of ${queue.length} page(s) were done.`,
+        );
+      }
     } catch (error) {
-      logger.error("Failed to start mass scraping:", error);
+      // This used to log "Failed to start mass scraping" whatever had gone
+      // wrong — including errors hours into a run — and close nothing out, so
+      // the run log stayed "in progress" with no reason given.
+      const message = error instanceof Error ? error.message : String(error);
+      logger.error("The run stopped because of an error:", error);
       shouldContinueProcessingRef.current = false;
-      await flushProcessedPostIds();
-      setQueueProgress(null);
-      stopScraping();
+      await endRun(
+        "Processing stopped by an error.",
+        `Stopped by an error: ${message}`,
+      );
     }
+  };
+
+  /**
+   * Close a run out, whatever ended it: save progress, record why it ended in
+   * the console, the run log and the report, and stop the heartbeat.
+   */
+  const endRun = async (note: string, reason: string) => {
+    stopReasonRef.current = reason;
+    runEndedAtRef.current = Date.now();
+    if (heartbeatTimerRef.current) {
+      clearInterval(heartbeatTimerRef.current);
+      heartbeatTimerRef.current = null;
+    }
+    try {
+      await flushProcessedPostIds();
+    } catch (error) {
+      logger.error("Could not save processed posts at the end of the run", error);
+    }
+    setCurrentPostInfo(null);
+    setQueueProgress(null);
+    stopScraping();
+    logger.always(`${note} Stop reason: ${reason}`);
+    logRunSummary();
+    // Closes the log out and makes sure the final state reaches disk, rather
+    // than relying on anyone pressing the report button.
+    await finishRunLog(note, reason);
   };
 
   const handleStopScraping = async () => {
     try {
+      // Recorded before the flag flips, so the run loop finds it when it
+      // notices it has been told to stop.
+      stopReasonRef.current = "You pressed Stop.";
+      logger.always("Stop pressed; the run will end after the current step.");
       shouldContinueProcessingRef.current = false;
       setCurrentPostInfo(null);
       stopScraping();
@@ -1276,7 +1407,10 @@ function SidebarApp() {
       const report = formatDiagnosticsReport(diagnosticsRef.current, {
         url: currentUrl,
         startedAt: runStartedAtRef.current ?? undefined,
-        finishedAt: Date.now(),
+        finishedAt: runEndedAtRef.current ?? undefined,
+        stopReason: scrapingStatus.isScraping
+          ? "Still running when this report was saved."
+          : (stopReasonRef.current ?? undefined),
         counts: reasonCountsRef.current,
         downloaded: downloadedCountRef.current,
       });
@@ -1331,79 +1465,6 @@ function SidebarApp() {
       return false;
     }
   })();
-
-  // Show different content if not on Reddit
-  if (!isRedditPage) {
-    return (
-      <div
-        className="w-full h-full min-h-screen p-4 bg-gradient-to-br from-gray-50 to-white flex flex-col items-center justify-center"
-        style={{ minWidth: "300px" }}
-      >
-        {/* Header */}
-        <div className="text-center mb-6">
-          <div className="w-16 h-16 bg-orange-500 rounded-full flex items-center justify-center mx-auto mb-4">
-            <Icon icon="lucide:alert-circle" className="text-white w-8 h-8" />
-          </div>
-          <h1 className="text-xl font-bold text-gray-800 mb-2">RedditGrab</h1>
-          <p className="text-sm text-gray-600 mb-4">
-            This extension only works on Reddit.com
-          </p>
-        </div>
-
-        {/* Current URL Display */}
-        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 mb-6 w-full">
-          <div className="flex items-start space-x-3">
-            <Icon
-              icon="lucide:info"
-              className="text-yellow-600 w-5 h-5 mt-0.5 flex-shrink-0"
-            />
-            <div>
-              <h3 className="text-sm font-medium text-yellow-800 mb-1">
-                Current Page
-              </h3>
-              <p className="text-xs text-yellow-700 break-all">
-                {currentUrl || "Unable to detect current page"}
-              </p>
-            </div>
-          </div>
-        </div>
-
-        {/* Instructions */}
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 w-full">
-          <div className="flex items-start space-x-3">
-            <Icon
-              icon="lucide:lightbulb"
-              className="text-blue-600 w-5 h-5 mt-0.5 shrink-0"
-            />
-            <div>
-              <h3 className="text-sm font-medium text-blue-800 mb-2">
-                How to use:
-              </h3>
-              <ol className="text-xs text-blue-700 space-y-1 list-decimal list-inside">
-                <li>Navigate to any Reddit page (reddit.com)</li>
-                <li>Open this sidebar panel</li>
-                <li>Configure your download settings</li>
-                <li>Click "Start Mass Download" to begin</li>
-              </ol>
-            </div>
-          </div>
-        </div>
-
-        {/* Reddit Link */}
-        <div className="mt-6">
-          <a
-            href="https://reddit.com"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center space-x-2 bg-orange-500 hover:bg-orange-600 text-white px-4 py-2 rounded-lg transition-colors"
-          >
-            <Icon icon="lucide:external-link" className="w-4 h-4" />
-            <span className="text-sm font-medium">Go to Reddit</span>
-          </a>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div
@@ -1904,13 +1965,24 @@ function SidebarApp() {
           </div>
         )}
 
-      <div className="mb-3">
+      <div className="mb-3 space-y-3">
+        <PresetsPanel
+          disabled={scrapingStatus.isScraping}
+          onApplied={() => setSettingsVersion((version) => version + 1)}
+          startupNotice={presetStartupNotice}
+        />
         <MemoryPanel />
       </div>
 
       <div className="space-y-3">
         {!scrapingStatus.isScraping ? (
-          <Button onClick={() => handleMassScrape()} className="w-full">
+          <Button
+            onClick={() => handleMassScrape()}
+            className="w-full"
+            // Off Reddit there's nothing on this page to download; a page list
+            // still works, because the run opens each page itself.
+            disabled={!isRedditPage && !urlQueueInput.trim()}
+          >
             <Icon icon="lucide:download" className="w-4 h-4" />
             Start Mass Download
           </Button>
@@ -1929,7 +2001,9 @@ function SidebarApp() {
             ? "Auto-scrolling and downloading media posts..."
             : queueStatuses.length > 0 || urlQueueInput.trim()
               ? "This will visit each page in the list and download it"
-              : "This will scroll and download all media on the page"}
+              : isRedditPage
+                ? "This will scroll and download all media on the page"
+                : "Open a Reddit page, or add pages to the list above, to start"}
         </p>
         {!scrapingStatus.isScraping && (
           <div className="space-y-3 pl-1">
@@ -1938,7 +2012,10 @@ function SidebarApp() {
                 id="mass-download-scroll-up"
                 checked={massDownloadScrollUp}
                 onCheckedChange={(checked) =>
-                  setMassDownloadScrollUp(checked === true)
+                  {
+                    setMassDownloadScrollUp(checked === true);
+                    void massDownloadScrollUpStorage.setValue(checked === true);
+                  }
                 }
               />
               <label
@@ -1950,7 +2027,10 @@ function SidebarApp() {
             </div>
             <MassDownloadMediaFilter
               value={massDownloadMediaFilter}
-              onValueChange={setMassDownloadMediaFilter}
+              onValueChange={(value) => {
+                setMassDownloadMediaFilter(value);
+                void massDownloadMediaFilterStorage.setValue(value);
+              }}
             />
             <div className="flex flex-row items-center space-x-2">
               <Checkbox
@@ -2112,7 +2192,10 @@ function SidebarApp() {
             <p className="text-xs text-amber-800 dark:text-amber-200 mb-2">
               A run from {unfinishedRun.runId.replace("_", " ")} didn&apos;t
               finish ({unfinishedRun.downloaded} downloaded,{" "}
-              {unfinishedRun.failed} failed). Its log is still here.
+              {unfinishedRun.failed} failed). It was last seen running at{" "}
+              {new Date(unfinishedRun.lastSeenAt).toLocaleString()}, then the
+              sidebar or Firefox closed, or the extension was reloaded. Its
+              log is still here.
             </p>
             <div className="flex gap-2">
               <Button

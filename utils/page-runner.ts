@@ -64,7 +64,26 @@ export type PageRunnerDeps = {
    * listing again; new posts are near the top, so a few screens are enough.
    */
   caughtUpAfterIdleBatches?: number;
+  /**
+   * How many scans in a row may fail before the page is given up on. A single
+   * failure — the content script busy, Reddit mid-render, a reload not quite
+   * done — used to end the whole run on the spot, with nothing in the log to
+   * say so.
+   */
+  maxScanFailures?: number;
+  /** Wait between those retries. */
+  scanRetryDelayMs?: number;
+  /** Told why the page finished, when it ran out rather than being stopped. */
+  onExhausted?: (reason: string) => void;
 };
+
+/** Thrown when the page stops answering scans; the message says why. */
+export class PageUnresponsiveError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PageUnresponsiveError";
+  }
+}
 
 export const runPageUntilExhausted = async ({
   processBatch,
@@ -80,7 +99,11 @@ export const runPageUntilExhausted = async ({
   watchIntervalMs = 60_000,
   refreshPage,
   caughtUpAfterIdleBatches = 5,
+  maxScanFailures = 3,
+  scanRetryDelayMs = 5000,
+  onExhausted,
 }: PageRunnerDeps): Promise<PageRunOutcome> => {
+  let scanFailures = 0;
   let emptyScrolls = 0;
   /** True once the page has been reloaded for a re-check. */
   let rechecking = false;
@@ -93,7 +116,10 @@ export const runPageUntilExhausted = async ({
    */
   const exhausted = async (note: string): Promise<PageRunOutcome | null> => {
     log(note);
-    if (!keepWatching) return "exhausted";
+    if (!keepWatching) {
+      onExhausted?.(note);
+      return "exhausted";
+    }
     log(
       `Watching for new posts; checking again in ${Math.round(watchIntervalMs / 1000)}s.`,
     );
@@ -114,7 +140,24 @@ export const runPageUntilExhausted = async ({
   };
 
   while (shouldContinue()) {
-    const { queued } = await processBatch();
+    let queued: number;
+    try {
+      ({ queued } = await processBatch());
+      scanFailures = 0;
+    } catch (error) {
+      scanFailures += 1;
+      const message = error instanceof Error ? error.message : String(error);
+      if (scanFailures >= maxScanFailures) {
+        throw new PageUnresponsiveError(
+          `The page stopped answering: ${scanFailures} scans in a row failed. Last error: ${message}`,
+        );
+      }
+      log(
+        `Scan failed (${scanFailures} of ${maxScanFailures}): ${message}. Retrying in ${Math.round(scanRetryDelayMs / 1000)}s.`,
+      );
+      await sleep(scanRetryDelayMs);
+      continue;
+    }
     if (!shouldContinue()) return "stopped";
 
     if (queued > 0) {

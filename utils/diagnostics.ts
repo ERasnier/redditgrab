@@ -214,6 +214,8 @@ export const formatDiagnosticsReport = (
     url?: string;
     startedAt?: number;
     finishedAt?: number;
+    /** Why the run ended. */
+    stopReason?: string;
     /** Full counts per reason, including records that were not stored. */
     counts?: Record<string, number>;
     downloaded?: number;
@@ -241,6 +243,7 @@ export const formatDiagnosticsReport = (
   if (meta.finishedAt) {
     lines.push(`Run ended: ${new Date(meta.finishedAt).toISOString()}`);
   }
+  if (meta.stopReason) lines.push(`Stop reason: ${meta.stopReason}`);
   if (meta.downloaded !== undefined) {
     lines.push(`Downloaded: ${meta.downloaded}`);
   }

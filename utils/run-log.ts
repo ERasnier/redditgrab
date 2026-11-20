@@ -41,6 +41,16 @@ type RunLogState = {
   failed: number;
   /** True once the run has ended, so a stale log isn't resumed. */
   finished: boolean;
+  /** Why the run ended, in plain words. */
+  stopReason?: string;
+  /** When the run ended. */
+  endedAt?: number;
+  /**
+   * Last time the running sidebar checked in. A run cut short by the sidebar
+   * or Firefox closing can't record why; this is how close to the end the
+   * record goes.
+   */
+  heartbeatAt?: number;
 };
 
 /**
@@ -91,6 +101,7 @@ export const startRunLog = async (url: string) => {
     downloaded: 0,
     failed: 0,
     finished: false,
+    heartbeatAt: now.getTime(),
   };
   dirty = true;
   lastFlushAt = 0;
@@ -156,6 +167,13 @@ export const logRunNote = async (text: string) => {
   await maybeFlush();
 };
 
+/** Record that the run is still alive. Called on a timer while it runs. */
+export const runLogHeartbeat = async () => {
+  if (!state) return;
+  state.heartbeatAt = Date.now();
+  await persist();
+};
+
 export const noteDownloaded = async (count: number) => {
   if (!state) return;
   state.downloaded = count;
@@ -174,6 +192,15 @@ export const formatRunLog = (snapshot: RunLogState): string => {
     `Status: ${snapshot.finished ? "finished" : "in progress"} — ` +
       `${snapshot.downloaded} downloaded, ${snapshot.failed} failed`,
   );
+  if (snapshot.endedAt) {
+    lines.push(`Run ended: ${new Date(snapshot.endedAt).toISOString()}`);
+  }
+  if (snapshot.stopReason) lines.push(`Stop reason: ${snapshot.stopReason}`);
+  if (!snapshot.finished && snapshot.heartbeatAt) {
+    lines.push(
+      `Last sign of life: ${new Date(snapshot.heartbeatAt).toISOString()}`,
+    );
+  }
   lines.push(`Updated: ${new Date().toISOString()}`);
   lines.push("");
 
@@ -248,10 +275,16 @@ const maybeFlush = async ({ force = false } = {}) => {
 };
 
 /** Close the log out and make sure the final state is on disk. */
-export const finishRunLog = async (note: string) => {
+export const finishRunLog = async (note: string, stopReason?: string) => {
   if (!state) return;
   state.finished = true;
-  await append({ at: Date.now(), kind: "run", text: note });
+  state.endedAt = Date.now();
+  state.stopReason = stopReason ?? note;
+  await append({
+    at: Date.now(),
+    kind: "run",
+    text: stopReason && stopReason !== note ? `${note} Stop reason: ${stopReason}` : note,
+  });
   await maybeFlush({ force: true });
   logger.always(`Run log written: ${fileNameFor(state.runId)}`);
 };
@@ -270,10 +303,29 @@ export const recoverUnfinishedRunLog = async (): Promise<RunLogState | null> => 
   }
 };
 
+/**
+ * What can be said about a run that never recorded its own end: nothing in it
+ * was running to write it, so the sidebar was closed, Firefox quit, or the
+ * extension was reloaded. The last heartbeat says roughly when.
+ */
+export const recoveredEnding = (
+  saved: RunLogState,
+): Pick<RunLogState, "stopReason" | "endedAt"> => {
+  const last = saved.heartbeatAt ?? saved.entries.at(-1)?.at ?? saved.startedAt;
+  return {
+    endedAt: last,
+    stopReason:
+      saved.stopReason ??
+      "The run never recorded an ending: the sidebar or Firefox was closed, " +
+        "or the extension was reloaded, while it was going. It was last seen " +
+        `running at ${new Date(last).toISOString()}.`,
+  };
+};
+
 /** Write a recovered log to disk under its original run id. */
 export const writeRecoveredRunLog = async (saved: RunLogState) => {
   const url = createTextFileUrl(
-    formatRunLog({ ...saved, finished: true }),
+    formatRunLog({ ...saved, finished: true, ...recoveredEnding(saved) }),
     "text/plain;charset=utf-8",
   );
   await downloadAndRelease(url, fileNameFor(saved.runId), {

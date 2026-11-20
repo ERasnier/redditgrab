@@ -2,8 +2,22 @@ import { onMessage } from "webext-bridge/background";
 import { DownloadRequestMessage } from "@/types/shim";
 import type { SkipReason } from "@/utils/diagnostics";
 import { getExtensionMemoryStats } from "@/utils/memory-stats";
+import { autoImportPresets } from "@/utils/presets";
 
 export default defineBackground(() => {
+  // A temporarily loaded add-on starts every Firefox session with empty
+  // storage. If presets were exported into the extension's folder, put them
+  // back before anything reads the settings.
+  void autoImportPresets()
+    .then((result) => {
+      if (result.status === "imported") {
+        logger.always(
+          `Presets restored from the extension folder (exported ${new Date(result.exportedAt).toLocaleString()}).`,
+        );
+      }
+    })
+    .catch((error) => logger.error("Automatic preset import failed:", error));
+
   // For the sidebar's memory panel: what the download side is holding now.
   onMessage("GET_MEMORY_STATS", () => getExtensionMemoryStats());
 

@@ -212,3 +212,44 @@ export const savedQueueRun = storage.defineItem<SavedQueueRun | null>(
   "local:savedQueueRun",
   { fallback: null },
 );
+
+// The mass-download choices that used to reset every time the sidebar opened.
+// Stored now so presets can carry them.
+export const massDownloadMediaFilter = storage.defineItem<
+  "all" | "images" | "videos"
+>("local:massDownloadMediaFilter", { fallback: "all" });
+
+export const massDownloadScrollUp = storage.defineItem(
+  "local:massDownloadScrollUp",
+  { fallback: false },
+);
+
+/** A named snapshot of the settings, made with "Save current as preset". */
+export type NamedPreset = {
+  name: string;
+  savedAt: number;
+  settings: Record<string, unknown>;
+};
+
+export const namedPresets = storage.defineItem<NamedPreset[]>(
+  "local:namedPresets",
+  { fallback: [] },
+);
+
+/**
+ * The folder, inside Firefox's download folder, that the extension was loaded
+ * from. The preset file is written there because it's the one place on disk
+ * the extension can read back by itself.
+ */
+export const presetFolder = storage.defineItem("local:presetFolder", {
+  fallback: "redditgrab-1.3.0-firefox",
+});
+
+/**
+ * exportedAt of the preset file last exported or imported here. A file newer
+ * than this — or any file, when storage has been wiped — is imported.
+ */
+export const presetsSyncedAt = storage.defineItem<number | null>(
+  "local:presetsSyncedAt",
+  { fallback: null },
+);
