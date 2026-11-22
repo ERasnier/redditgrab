@@ -3,11 +3,32 @@ import { DownloadRequestMessage } from "@/types/shim";
 import type { SkipReason } from "@/utils/diagnostics";
 import { getExtensionMemoryStats } from "@/utils/memory-stats";
 import { autoImportPresets } from "@/utils/presets";
+import {
+  autoImportHistory,
+  backfillFromProcessedList,
+  clearHistoryEverywhere,
+  countRecords,
+  recordDownload,
+  writeHistoryFile,
+  type HistoryAutoImport,
+} from "@/utils/download-history";
+import { listenForSavedFiles } from "@/utils/blob-utils";
+
+/** Download requests in progress, for telling whose files are whose. */
+let activeRequests = 0;
+/** Set when requests overlapped; cleared once none are running. */
+let overlapped = false;
 
 export default defineBackground(() => {
   // A temporarily loaded add-on starts every Firefox session with empty
   // storage. If presets were exported into the extension's folder, put them
   // back before anything reads the settings.
+  // Presets first: they carry the folder setting the history file is written
+  // to. Then the download history, which puts the processed-posts list back
+  // so nothing already saved is downloaded again.
+  let historyStartup: HistoryAutoImport | { status: "failed"; error: string } = {
+    status: "none",
+  };
   void autoImportPresets()
     .then((result) => {
       if (result.status === "imported") {
@@ -16,14 +37,55 @@ export default defineBackground(() => {
         );
       }
     })
-    .catch((error) => logger.error("Automatic preset import failed:", error));
+    .catch((error) => logger.error("Automatic preset import failed:", error))
+    .then(() => autoImportHistory())
+    .then(async (result) => {
+      historyStartup = result;
+      // Give every id from before this feature a record, so the first file
+      // written holds the whole history.
+      await backfillFromProcessedList();
+    })
+    .catch((error) => {
+      historyStartup = { status: "failed", error: String(error) };
+      logger.error("Automatic history import failed:", error);
+    });
+
+  onMessage("HISTORY_STATUS", async () => ({
+    records: await countRecords(),
+    startup: historyStartup,
+  }));
+  onMessage("HISTORY_WRITE", () => writeHistoryFile());
+  onMessage("HISTORY_CLEAR", () => clearHistoryEverywhere());
 
   // For the sidebar's memory panel: what the download side is holding now.
   onMessage("GET_MEMORY_STATS", () => getExtensionMemoryStats());
 
   onMessage("DOWNLOAD_REQUEST", async ({ data }) => {
+    // Collect where this post's files are saved, for the history record. If
+    // two requests overlap, a file can't be told apart, so neither records
+    // paths it may not own.
+    activeRequests += 1;
+    if (activeRequests > 1) overlapped = true;
+    const files: string[] = [];
+    const stopListening = listenForSavedFiles((path) => files.push(path));
     try {
       await handleDownloadRequest(data);
+      if (data.postId) {
+        void recordDownload({
+          postId: data.postId,
+          permalink: data.postId.startsWith("t3_")
+            ? `https://www.reddit.com/comments/${data.postId.slice(3)}/`
+            : undefined,
+          subreddit: data.subredditName || undefined,
+          title: data.postTitle,
+          author: data.postAuthor,
+          mediaType: data.mediaContentType,
+          urls: data.urls,
+          files: activeRequests > 1 || overlapped ? [] : files,
+          folder: data.folderDestination,
+          downloadedAt: Date.now(),
+        });
+      }
       return { success: true };
     } catch (error) {
       const message =
@@ -35,6 +97,10 @@ export default defineBackground(() => {
         { postId: data.postId, urls: data.urls },
       );
       return { success: false, message, reason: classifyFailure(message) };
+    } finally {
+      stopListening();
+      activeRequests -= 1;
+      if (activeRequests === 0) overlapped = false;
     }
   });
 

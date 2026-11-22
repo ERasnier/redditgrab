@@ -39,6 +39,7 @@ import {
 } from "@/utils/storage";
 import { MemoryPanel } from "@/components/memory-panel";
 import { PresetsPanel } from "@/components/presets-panel";
+import { HistoryPanel } from "@/components/history-panel";
 import { autoImportPresets } from "@/utils/presets";
 import {
   formatDiagnosticsReport,
@@ -1354,6 +1355,10 @@ function SidebarApp() {
     // Closes the log out and makes sure the final state reaches disk, rather
     // than relying on anyone pressing the report button.
     await finishRunLog(note, reason);
+    // Bring the history file up to date now rather than in a few minutes.
+    void sendMessage("HISTORY_WRITE", undefined, "background").catch((error) =>
+      logger.error("Could not write the history file at the end of the run:", error),
+    );
   };
 
   const handleStopScraping = async () => {
@@ -1430,14 +1435,24 @@ function SidebarApp() {
     }
   };
 
+  // Clearing now also empties the history database and its file (otherwise
+  // the next Firefox start would restore everything), so it takes a second
+  // click to confirm. A backup copy is saved first.
+  const [confirmClearHistory, setConfirmClearHistory] = useState(false);
   const handleClearProcessedPosts = async () => {
+    if (!confirmClearHistory) {
+      setConfirmClearHistory(true);
+      setTimeout(() => setConfirmClearHistory(false), 6000);
+      return;
+    }
+    setConfirmClearHistory(false);
     try {
       setIsClearingHistory(true);
-      await processedPostIds.setValue([]);
+      await sendMessage("HISTORY_CLEAR", undefined, "background");
       resetProcessedPostIdCache();
-      logger.log("Cleared processed posts history");
-      // Small delay to show the loading state
-      await new Promise((resolve) => setTimeout(resolve, 500));
+      logger.always(
+        "Cleared the processed posts history and the history file; a backup was saved to RedditGrab/ in your downloads folder.",
+      );
     } catch (error) {
       logger.error("Failed to clear processed posts:", error);
     } finally {
@@ -1971,6 +1986,10 @@ function SidebarApp() {
           onApplied={() => setSettingsVersion((version) => version + 1)}
           startupNotice={presetStartupNotice}
         />
+        <HistoryPanel
+          disabled={scrapingStatus.isScraping}
+          onImported={() => resetProcessedPostIdCache()}
+        />
         <MemoryPanel />
       </div>
 
@@ -2278,6 +2297,8 @@ function SidebarApp() {
                 />
                 Clearing...
               </>
+            ) : confirmClearHistory ? (
+              "Click again to clear history (a backup is saved first)"
             ) : (
               "Clear processed posts history"
             )}

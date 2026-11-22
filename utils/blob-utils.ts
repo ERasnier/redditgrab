@@ -20,6 +20,26 @@ export async function createBlobUrl(blob: Blob): Promise<string> {
   return url;
 }
 
+type FileSavedListener = (path: string) => void;
+const fileSavedListeners = new Set<FileSavedListener>();
+
+/**
+ * Be told the path of every file saved from now on, until the returned
+ * function is called. Used to record where a post's files went.
+ */
+export const listenForSavedFiles = (listener: FileSavedListener) => {
+  fileSavedListeners.add(listener);
+  return () => fileSavedListeners.delete(listener);
+};
+
+const announceSaved = (path: string) => {
+  for (const listener of fileSavedListeners) {
+    try {
+      listener(path);
+    } catch {}
+  }
+};
+
 /** Give up after this long with no new bytes. Progress resets the clock. */
 const DOWNLOAD_STALL_TIMEOUT_MS = 2 * 60 * 1000;
 /** Absolute ceiling, so nothing waits forever. */
@@ -150,6 +170,8 @@ export async function downloadAndWait(
     throw new Error("browser did not return a download id");
   }
   if (!(await verifyDownloads.getValue())) {
+    // Not waited on, so only the intended path is known.
+    if (filename) announceSaved(filename);
     return;
   }
 
@@ -167,6 +189,7 @@ export async function downloadAndWait(
     );
   }
   logger.log(`Download ${downloadId} complete: ${result.filename ?? filename}`);
+  announceSaved(result.filename ?? filename ?? "");
   await forgetFinishedDownload(downloadId);
 }
 

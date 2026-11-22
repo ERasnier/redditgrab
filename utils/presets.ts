@@ -1,5 +1,5 @@
 import { logger } from "./logger";
-import { createTextFileUrl, revokeIfObjectUrl } from "./blob-utils";
+import { readExtensionFolderFile, writeExtensionFolderFile } from "./extension-folder";
 import * as stored from "./storage";
 
 /**
@@ -158,18 +158,8 @@ export const importPresetFile = async (file: PresetFile) => {
 
 /** The preset file in the extension's own folder, if there is one. */
 export const readBundledPresetFile = async (): Promise<PresetFile | null> => {
-  let response: Response;
-  try {
-    // Not a build output, so WXT's typed paths don't know it.
-    const getURL = browser.runtime.getURL as (path: string) => string;
-    response = await fetch(getURL(`/${PRESET_FILE_NAME}`), {
-      cache: "no-store",
-    });
-  } catch {
-    // Firefox answers a missing extension file with a network error.
-    return null;
-  }
-  if (!response.ok) return null;
+  const response = await readExtensionFolderFile(PRESET_FILE_NAME);
+  if (!response) return null;
   try {
     return parsePresetFile(await response.text());
   } catch (error) {
@@ -221,26 +211,10 @@ export const buildPresetFile = async (): Promise<PresetFile> => ({
  */
 export const exportPresets = async (): Promise<ExportResult> => {
   const file = await buildPresetFile();
-  const folder = (await stored.presetFolder.getValue()).replace(/^[\\/]+|[\\/]+$/g, "");
-  const relativePath = folder ? `${folder}/${PRESET_FILE_NAME}` : PRESET_FILE_NAME;
-
-  const url = createTextFileUrl(
-    JSON.stringify(file, null, 2),
-    "application/json;charset=utf-8",
+  const savedTo = await writeExtensionFolderFile(
+    PRESET_FILE_NAME,
+    new Blob([JSON.stringify(file, null, 2)], { type: "application/json" }),
   );
-  let savedTo = relativePath;
-  try {
-    const downloadId = await browser.downloads.download({
-      url,
-      filename: relativePath,
-      saveAs: false,
-      conflictAction: "overwrite",
-    });
-    savedTo = await waitForPath(downloadId, relativePath);
-  } finally {
-    revokeIfObjectUrl(url);
-  }
-
   await stored.presetsSyncedAt.setValue(file.exportedAt);
   const readBack = await readBundledPresetFile();
   return {
@@ -248,23 +222,3 @@ export const exportPresets = async (): Promise<ExportResult> => {
     autoImportReady: readBack?.exportedAt === file.exportedAt,
   };
 };
-
-/** Wait for a download to finish and return the full path it was saved to. */
-const waitForPath = async (downloadId: number, fallback: string) => {
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    const [item] = await browser.downloads.search({ id: downloadId });
-    if (item?.state === "complete") {
-      const path = item.filename;
-      // A small housekeeping file; keep it off the download list.
-      void browser.downloads.erase({ id: downloadId }).catch(() => {});
-      return path || fallback;
-    }
-    if (item?.state === "interrupted") {
-      throw new Error(`Firefox couldn't save the preset file: ${item.error ?? "interrupted"}`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
-  }
-  return fallback;
-};
-

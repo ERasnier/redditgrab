@@ -126,6 +126,23 @@ declare module "webext-bridge" {
       { success: boolean; removed: boolean }
     >;
     GET_PAGE_STATS: ProtocolWithReturn<void, PageStats>;
+    HISTORY_STATUS: ProtocolWithReturn<
+      void,
+      {
+        records: number;
+        startup:
+          | import("@/utils/download-history").HistoryAutoImport
+          | { status: "failed"; error: string };
+      }
+    >;
+    HISTORY_WRITE: ProtocolWithReturn<
+      void,
+      import("@/utils/download-history").HistoryFileResult
+    >;
+    HISTORY_CLEAR: ProtocolWithReturn<
+      void,
+      import("@/utils/download-history").HistoryFileResult
+    >;
     GET_MEMORY_STATS: ProtocolWithReturn<
       void,
       import("@/utils/memory-stats").ExtensionMemoryStats

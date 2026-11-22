@@ -253,3 +253,12 @@ export const presetsSyncedAt = storage.defineItem<number | null>(
   "local:presetsSyncedAt",
   { fallback: null },
 );
+
+/**
+ * exported_at of the history file last written or read here. A newer file —
+ * or any file, once storage has been wiped — is read back in on start.
+ */
+export const historySyncedAt = storage.defineItem<number | null>(
+  "local:historySyncedAt",
+  { fallback: null },
+);
