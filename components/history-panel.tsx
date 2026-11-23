@@ -1,7 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { sendMessage } from "webext-bridge/popup";
 import { Button } from "@/components/ui/button";
-import { HISTORY_FILE_NAME, importHistoryFromFile } from "@/utils/download-history";
+import {
+  HISTORY_FILE_NAME,
+  JOURNAL_FILE_NAME,
+  importHistoryFromFile,
+} from "@/utils/download-history";
 import { logger } from "@/utils/logger";
 
 type Notice = { kind: "ok" | "warn" | "error"; text: string };
@@ -37,7 +41,7 @@ export const HistoryPanel = ({
       const startup = status.startup;
       setStartupText(
         startup.status === "imported"
-          ? `Restored at start from ${HISTORY_FILE_NAME}: ${startup.records} posts, ${startup.restoredIds} put back in the processed list.`
+          ? `Restored at start: ${startup.records} posts read, ${startup.restoredIds} put back in the processed list.`
           : startup.status === "failed"
             ? `Couldn't read ${HISTORY_FILE_NAME} at start: ${startup.error}`
             : startup.status === "none"
@@ -106,10 +110,12 @@ export const HistoryPanel = ({
         <p className="text-[11px] leading-snug text-gray-500 dark:text-gray-400">
           Every downloaded post is recorded — link, subreddit, title, media
           links and where the files were saved — in {HISTORY_FILE_NAME} in the
-          extension folder (set under Presets). It&apos;s updated a few minutes
-          after each download and at the end of every run, and read back
-          whenever Firefox starts. It&apos;s a normal SQLite database you can
-          open with other tools.
+          extension folder (set under Presets). Each post is saved to disk as
+          soon as it downloads, nothing to press: first into{" "}
+          {JOURNAL_FILE_NAME}, then folded into the database every 250 posts,
+          at the end of every run and after 10 quiet minutes. Both are read
+          back whenever Firefox starts. The .sqlite file is a normal SQLite
+          database you can open with other tools.
         </p>
         {startupText && (
           <p className="text-[11px] leading-snug text-gray-600 dark:text-gray-300">
@@ -118,7 +124,7 @@ export const HistoryPanel = ({
         )}
         <div className="flex gap-1.5">
           <Button size="sm" className="flex-1" onClick={saveNow} disabled={off}>
-            Save history file now
+            Save database now
           </Button>
           <Button
             size="sm"

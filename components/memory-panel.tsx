@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { sendMessage } from "webext-bridge/popup";
 import type { PageStats } from "@/types/shim";
+import { sendToTab } from "@/utils/tab-messaging";
 import type { ExtensionMemoryStats } from "@/utils/memory-stats";
 
 const POLL_MS = 3000;
@@ -54,8 +55,18 @@ export const MemoryPanel = () => {
   useEffect(() => {
     let cancelled = false;
 
+    // One poll at a time: a slow answer shouldn't let requests stack up.
+    let polling = false;
     const poll = async () => {
-      if (document.visibilityState !== "visible") return;
+      if (document.visibilityState !== "visible" || polling) return;
+      polling = true;
+      try {
+        await pollOnce();
+      } finally {
+        polling = false;
+      }
+    };
+    const pollOnce = async () => {
 
       try {
         const stats = await sendMessage("GET_MEMORY_STATS", undefined, "background");
@@ -68,7 +79,10 @@ export const MemoryPanel = () => {
           if (!cancelled) setPage(null);
           return;
         }
-        const stats = await sendMessage(
+        // Through sendToTab: a request to a tab without the content script
+        // would otherwise be parked by the messaging library for good, one
+        // more every poll.
+        const stats = await sendToTab(
           "GET_PAGE_STATS",
           undefined,
           `content-script@${tab.id}`,

@@ -379,6 +379,10 @@ export async function downloadVideo(options: DownloadVideoOptions) {
 
   } = options;
 
+  // Object URLs made along the way. downloadAndRelease frees the one it
+  // downloads; these are freed on the way out if anything throws first, or a
+  // whole video stays in memory for the rest of the session.
+  const made: string[] = [];
   try {
     if (!initialUrl) {
       throw new Error("downloadVideo called with no url");
@@ -399,6 +403,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
     };
 
     const url = await getSourceUrl();
+    made.push(url);
 
     const pattern = filenamePattern || "{subreddit}_{timestamp}_{filename}";
 
@@ -429,6 +434,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
         const processedVideoBlob = await addTextToVideo(videoBlob, postTitle);
 
         downloadUrl = await createBlobUrl(processedVideoBlob);
+        made.push(downloadUrl);
         // The unprocessed video is no longer needed; free it now.
         revokeIfObjectUrl(url);
       } catch (error) {
@@ -445,6 +451,9 @@ export async function downloadVideo(options: DownloadVideoOptions) {
     // silent success and the failed post was never retried/skipped.
     logger.error("Video download failed:", err);
     throw err;
+  } finally {
+    // Revoking twice is harmless; a URL never freed is a leaked video.
+    for (const objectUrl of made) revokeIfObjectUrl(objectUrl);
   }
 }
 
@@ -872,8 +881,11 @@ export async function getVideoUrl(mediaElement: Element) {
   const sourceUrl = mediaElement.getAttribute("src");
   if (sourceUrl && sourceUrl.includes(".m3u8")) {
     if (sourceUrl.includes("api.redgifs.com")) {
-      const url = await getRedGifsSourceUrl(sourceUrl);
-      return url;
+      // Resolved later, in the background, like every other RedGIFs link.
+      // Resolving here ran ffmpeg inside the Reddit tab when the API route
+      // failed, and left the finished video there as an object URL the
+      // background could never free.
+      return sourceUrl;
     } else {
       // Reddit HLS
       const url = await getHighestQualityHLS(sourceUrl);

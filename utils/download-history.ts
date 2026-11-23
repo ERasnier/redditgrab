@@ -21,6 +21,15 @@ import { historySyncedAt, processedPostIds } from "./storage";
  */
 
 export const HISTORY_FILE_NAME = "redditgrab-history.sqlite";
+/**
+ * Posts downloaded since the database file was last written, saved after
+ * every single post. Rewriting the whole database per post would copy the
+ * entire history each time; this file stays small, and is folded into the
+ * database every JOURNAL_LIMIT posts, at the end of a run and when things go
+ * quiet.
+ */
+export const JOURNAL_FILE_NAME = "redditgrab-history-recent.json";
+const JOURNAL_LIMIT = 250;
 const FORMAT = "redditgrab-history";
 const VERSION = 1;
 
@@ -86,6 +95,29 @@ export const countRecords = async () => {
   return requestToPromise(db.transaction(STORE).objectStore(STORE).count());
 };
 
+/**
+ * Visit every record without loading them all into one array first. `visit`
+ * runs synchronously inside the cursor's callback.
+ */
+const forEachRecord = async (visit: (record: HistoryRecord) => void) => {
+  const db = await openDb();
+  const tx = db.transaction(STORE);
+  const request = tx.objectStore(STORE).openCursor();
+  await new Promise<void>((resolve, reject) => {
+    request.onsuccess = () => {
+      const cursor = request.result;
+      if (!cursor) return resolve();
+      try {
+        visit(cursor.value as HistoryRecord);
+      } catch (error) {
+        return reject(error);
+      }
+      cursor.continue();
+    };
+    request.onerror = () => reject(request.error);
+  });
+};
+
 export const getAllRecords = async (): Promise<HistoryRecord[]> => {
   const db = await openDb();
   return requestToPromise(db.transaction(STORE).objectStore(STORE).getAll());
@@ -137,10 +169,30 @@ export const clearRecords = async () => {
 
 // ------------------------------------------------------------- recording
 
-/** Record a finished download, and schedule the file on disk to be updated. */
+/**
+ * Record a finished download and save it to disk straight away: into the
+ * recent-downloads file after every post, and into the database once enough
+ * have built up.
+ */
 export const recordDownload = async (record: Omit<HistoryRecord, "source">) => {
   try {
-    await putRecords([{ ...record, source: "download" }]);
+    const full: HistoryRecord = { ...record, source: "download" };
+    await putRecords([full]);
+    journal.push(full);
+    if (journal.length >= JOURNAL_LIMIT) {
+      // Posts arriving while the database is written wait for that write
+      // rather than each queueing another full one.
+      if (!databaseWriteQueued) {
+        databaseWriteQueued = true;
+        void writeHistoryFile()
+          .catch((error) => logger.error("Could not write the history file:", error))
+          .finally(() => {
+            databaseWriteQueued = false;
+          });
+      }
+    } else {
+      queueJournalWrite();
+    }
     scheduleHistoryFileWrite();
   } catch (error) {
     // The download itself worked; never fail it over the record of it.
@@ -182,11 +234,27 @@ const mergeIntoProcessedList = async (ids: string[]) => {
 // ---------------------------------------------------------------- SQLite
 
 let sqlPromise: Promise<SqlJsStatic> | null = null;
-const loadSql = () => {
-  sqlPromise ??= initSqlJs({
-    locateFile: () => browser.runtime.getURL("/sqljs/sql-wasm.wasm"),
-  });
-  return sqlPromise;
+let sqlUsers = 0;
+
+/**
+ * Borrow the SQLite engine for one job, and let it go afterwards.
+ *
+ * A WebAssembly heap grows to fit the biggest database it has held and never
+ * shrinks, so a cached engine kept the background page at the size of the
+ * largest history file for the rest of the session. Loading it per job costs
+ * a fraction of a second; dropping it lets the whole heap be collected.
+ */
+const withSql = async <T>(job: (SQL: SqlJsStatic) => Promise<T> | T): Promise<T> => {
+  sqlUsers += 1;
+  try {
+    sqlPromise ??= initSqlJs({
+      locateFile: () => browser.runtime.getURL("/sqljs/sql-wasm.wasm"),
+    });
+    return await job(await sqlPromise);
+  } finally {
+    sqlUsers -= 1;
+    if (sqlUsers === 0) sqlPromise = null;
+  }
 };
 
 const SCHEMA = `
@@ -210,11 +278,11 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
 `;
 
 /** Build the SQLite file for a set of records. */
-export const buildHistoryDatabase = async (
-  records: HistoryRecord[],
+export const buildHistoryDatabase = (
+  records: HistoryRecord[] | ((add: (record: HistoryRecord) => void) => Promise<void>),
   exportedAt: number,
-): Promise<Uint8Array> => {
-  const SQL = await loadSql();
+): Promise<Uint8Array> =>
+  withSql(async (SQL) => {
   const db = new SQL.Database();
   try {
     db.run(SCHEMA);
@@ -222,7 +290,7 @@ export const buildHistoryDatabase = async (
     const insert = db.prepare(
       "INSERT OR REPLACE INTO downloads VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
     );
-    for (const r of records) {
+    const add = (r: HistoryRecord) => {
       insert.run([
         r.postId,
         r.permalink ?? null,
@@ -237,7 +305,9 @@ export const buildHistoryDatabase = async (
         r.downloadedAt ? new Date(r.downloadedAt).toISOString() : null,
         r.source,
       ]);
-    }
+    };
+    if (Array.isArray(records)) records.forEach(add);
+    else await records(add);
     insert.free();
     const meta = db.prepare("INSERT INTO meta VALUES (?, ?)");
     meta.run(["format", FORMAT]);
@@ -250,7 +320,7 @@ export const buildHistoryDatabase = async (
   } finally {
     db.close();
   }
-};
+  });
 
 const parseJsonArray = (value: unknown): string[] => {
   if (typeof value !== "string") return [];
@@ -263,10 +333,10 @@ const parseJsonArray = (value: unknown): string[] => {
 };
 
 /** Read records out of a history database. */
-export const readHistoryDatabase = async (
+export const readHistoryDatabase = (
   bytes: Uint8Array,
-): Promise<{ records: HistoryRecord[]; exportedAt: number | null }> => {
-  const SQL = await loadSql();
+): Promise<{ records: HistoryRecord[]; exportedAt: number | null }> =>
+  withSql((SQL) => {
   let db: Database;
   try {
     db = new SQL.Database(bytes);
@@ -314,7 +384,7 @@ export const readHistoryDatabase = async (
   } finally {
     db.close();
   }
-};
+  });
 
 /**
  * Pull post ids out of plain text: Reddit links (comments/<id>), thing ids
@@ -331,9 +401,51 @@ export const idsFromText = (text: string): string[] => {
 
 // ------------------------------------------------------------ the file
 
-const WRITE_DELAY_MS = 5 * 60 * 1000;
+/** Fold the recent posts into the database this long after the last one. */
+const WRITE_DELAY_MS = 10 * 60 * 1000;
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
-let writing: Promise<HistoryFileResult> | null = null;
+
+/** Posts recorded since the database file was last written. */
+let journal: HistoryRecord[] = [];
+
+/**
+ * Every write to disk goes through this chain, one at a time, so a journal
+ * write can never land on top of a newer database write or the reverse.
+ */
+let diskChain: Promise<unknown> = Promise.resolve();
+const onDisk = <T>(task: () => Promise<T>): Promise<T> => {
+  const next = diskChain.then(task, task);
+  diskChain = next.catch(() => {});
+  return next;
+};
+
+/** Set while a journal write is waiting its turn; later posts ride on it. */
+let journalWriteQueued = false;
+/** Set while a database write triggered by the journal filling up is pending. */
+let databaseWriteQueued = false;
+
+const writeJournal = async () => {
+  const snapshot = {
+    format: "redditgrab-history-recent",
+    version: VERSION,
+    writtenAt: Date.now(),
+    records: journal,
+  };
+  await writeExtensionFolderFile(
+    JOURNAL_FILE_NAME,
+    new Blob([JSON.stringify(snapshot)], { type: "application/json" }),
+  );
+};
+
+/** Save the recent-downloads file, coalescing posts that arrive meanwhile. */
+const queueJournalWrite = () => {
+  if (journalWriteQueued) return;
+  journalWriteQueued = true;
+  void onDisk(async () => {
+    journalWriteQueued = false;
+    await writeJournal();
+  }).catch((error) => logger.error("Could not save the recent downloads file:", error));
+};
 
 export type HistoryFileResult = {
   savedTo: string;
@@ -343,12 +455,12 @@ export type HistoryFileResult = {
 };
 
 /**
- * Write the history file a few minutes after the latest download, so a run
- * doesn't rewrite it per post but never leaves it far behind. The end of a
- * run writes it straight away.
+ * Fold the recent posts into the database once downloads have gone quiet.
+ * Each post is already safe on disk in the recent-downloads file; this keeps
+ * that file small. Restarted by every download.
  */
 export const scheduleHistoryFileWrite = () => {
-  if (writeTimer) return;
+  if (writeTimer) clearTimeout(writeTimer);
   writeTimer = setTimeout(() => {
     writeTimer = null;
     void writeHistoryFile().catch((error) =>
@@ -363,27 +475,32 @@ export const writeHistoryFile = async (): Promise<HistoryFileResult> => {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
-  // One write at a time; a second caller waits for, then repeats, the first.
-  while (writing) await writing.catch(() => {});
-  writing = (async () => {
+  return onDisk(async () => {
     await backfillFromProcessedList();
-    const records = await getAllRecords();
+    // Everything in the journal now is in the database being built; posts
+    // recorded during the build stay in the journal for the next write.
+    const folded = journal.length;
+    let count = 0;
     const exportedAt = Date.now();
-    let bytes: Uint8Array | null = await buildHistoryDatabase(records, exportedAt);
+    let bytes: Uint8Array | null = await buildHistoryDatabase(async (add) => {
+      await forEachRecord((record) => {
+        add(record);
+        count += 1;
+      });
+    }, exportedAt);
     const blob = new Blob([bytes as BlobPart], { type: "application/vnd.sqlite3" });
     bytes = null;
     const savedTo = await writeExtensionFolderFile(HISTORY_FILE_NAME, blob);
     await historySyncedAt.setValue(exportedAt);
+    journal = journal.slice(folded);
+    await writeJournal();
+    // A Blob from fetch is backed by the file, so its size can be checked
+    // without reading the whole database into memory again.
     const check = await readExtensionFolderFile(HISTORY_FILE_NAME);
-    const readable = !!check && (await check.arrayBuffer()).byteLength === blob.size;
-    logger.always(`History file written: ${records.length} posts → ${savedTo}`);
-    return { savedTo, records: records.length, readable };
-  })();
-  try {
-    return await writing;
-  } finally {
-    writing = null;
-  }
+    const readable = !!check && (await check.blob()).size === blob.size;
+    logger.always(`History file written: ${count} posts → ${savedTo}`);
+    return { savedTo, records: count, readable };
+  });
 };
 
 export type HistoryImportResult = {
@@ -435,21 +552,68 @@ export type HistoryAutoImport =
  * what was last written or read here — after Firefox wipes storage, always.
  */
 export const autoImportHistory = async (): Promise<HistoryAutoImport> => {
+  let result: HistoryImportResult = { records: 0, restoredIds: 0 };
+  let exportedAt: number | null = null;
+  let found = false;
+
   const response = await readExtensionFolderFile(HISTORY_FILE_NAME);
-  if (!response) return { status: "none" };
-  const { records, exportedAt } = await readHistoryDatabase(
-    new Uint8Array(await response.arrayBuffer()),
-  );
-  const syncedAt = await historySyncedAt.getValue();
-  if (syncedAt !== null && exportedAt !== null && exportedAt <= syncedAt) {
-    return { status: "up-to-date" };
+  if (response) {
+    found = true;
+    const syncedAt = await historySyncedAt.getValue();
+    const database = await readHistoryDatabase(
+      new Uint8Array(await response.arrayBuffer()),
+    );
+    exportedAt = database.exportedAt;
+    if (syncedAt === null || exportedAt === null || exportedAt > syncedAt) {
+      result = await importRecords(database.records);
+      await historySyncedAt.setValue(exportedAt ?? Date.now());
+    }
   }
-  const result = await importRecords(records);
-  await historySyncedAt.setValue(exportedAt ?? Date.now());
+
+  // Posts saved after the database was last written. Always merged — it's
+  // small, and merging the same posts twice changes nothing — and carried
+  // into this session's journal so they reach the database on its next write.
+  const recent = await readJournalFile();
+  if (recent.length) {
+    found = true;
+    const fromJournal = await importRecords(recent);
+    result = {
+      records: result.records + fromJournal.records,
+      restoredIds: result.restoredIds + fromJournal.restoredIds,
+    };
+    const known = new Set(journal.map((r) => r.postId));
+    journal = [...recent.filter((r) => !known.has(r.postId)), ...journal];
+  }
+
+  if (!found) return { status: "none" };
+  if (result.records === 0) return { status: "up-to-date" };
   logger.always(
-    `History restored from ${HISTORY_FILE_NAME}: ${result.records} posts, ${result.restoredIds} added back to the processed list.`,
+    `History restored: ${result.records} posts read, ${result.restoredIds} added back to the processed list.`,
   );
   return { status: "imported", exportedAt, ...result };
+};
+
+/** The recent-downloads file's records, or none. */
+const readJournalFile = async (): Promise<HistoryRecord[]> => {
+  const response = await readExtensionFolderFile(JOURNAL_FILE_NAME);
+  if (!response) return [];
+  try {
+    const body = (await response.json()) as { format?: string; records?: unknown };
+    if (body.format !== "redditgrab-history-recent" || !Array.isArray(body.records)) return [];
+    return body.records.filter(
+      (r): r is HistoryRecord =>
+        !!r && typeof (r as HistoryRecord).postId === "string" && (r as HistoryRecord).postId !== "",
+    ).map((r) => ({
+      ...r,
+      urls: Array.isArray(r.urls) ? r.urls : [],
+      files: Array.isArray(r.files) ? r.files : [],
+      downloadedAt: Number(r.downloadedAt) || 0,
+      source: r.source === "download" ? "download" : "imported",
+    }));
+  } catch (error) {
+    logger.error(`Could not read ${JOURNAL_FILE_NAME}:`, error);
+    return [];
+  }
 };
 
 /**
@@ -460,14 +624,18 @@ export const autoImportHistory = async (): Promise<HistoryAutoImport> => {
 export const clearHistoryEverywhere = async () => {
   // A copy of what's about to go, in the normal downloads folder, in case the
   // clear was a mistake. Import it from the sidebar to undo.
-  const records = await getAllRecords();
-  if (records.length > 0) {
+  if ((await countRecords()) > 0) {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const bytes = await buildHistoryDatabase(records, Date.now());
+    let bytes: Uint8Array | null = await buildHistoryDatabase(
+      (add) => forEachRecord(add),
+      Date.now(),
+    );
     const url = await createBlobUrl(new Blob([bytes as BlobPart]));
+    bytes = null;
     await downloadAndRelease(url, `RedditGrab/redditgrab-history-backup-${stamp}.sqlite`);
   }
   await clearRecords();
+  journal = [];
   await processedPostIds.setValue([]);
   return writeHistoryFile();
 };

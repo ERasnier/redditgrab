@@ -16,6 +16,7 @@ import {
   freeMemoryDuringRuns,
 } from "@/utils/storage";
 import { pruneFinishedPosts, releaseMedia, removePost } from "@/utils/page-pruning";
+import { ALIVE_MESSAGE } from "@/utils/tab-messaging";
 import { compact } from "es-toolkit";
 import { logger, isDebugEnabled } from "@/utils/logger";
 import { parseISO, isValid } from "date-fns";
@@ -764,13 +765,22 @@ export default defineContentScript({
     // and when the show/hide setting is toggled.
     // The watcher is handed the new list; use it rather than discarding it and
     // reading the whole list back out of storage again.
-    processedPostIds.watch((ids) => {
+    const unwatchProcessed = processedPostIds.watch((ids) => {
       setProcessedIdCache(ids);
       refreshDownloadedMarkers();
     });
-    showDownloadedMarkers.watch(() => {
+    const unwatchMarkers = showDownloadedMarkers.watch(() => {
       refreshDownloadedMarkers();
     });
+
+    // Lets the sidebar check, without the messaging library parking the
+    // request, that this page has a live content script before it sends
+    // anything. See utils/tab-messaging.ts.
+    const answerAlive = (message: unknown) =>
+      (message as { type?: string } | null)?.type === ALIVE_MESSAGE
+        ? Promise.resolve(true)
+        : undefined;
+    browser.runtime.onMessage.addListener(answerAlive);
 
     let scrollTimeout: ReturnType<typeof setTimeout> | undefined;
     const handleScroll = () => {
@@ -784,12 +794,17 @@ export default defineContentScript({
 
     window.addEventListener("scroll", handleScroll, { passive: true });
 
-    // Reddit is a SPA; the content script context is invalidated on navigation.
+    // The context is invalidated when the extension is reloaded or updated
+    // while this page stays open.
     // Drop the listener, the pending timer and the caches with it, rather than
     // leaving them attached to a dead context.
     ctx.onInvalidated(() => {
       window.removeEventListener("scroll", handleScroll);
       clearTimeout(scrollTimeout);
+      // The storage listeners held this context's caches and DOM helpers.
+      unwatchProcessed();
+      unwatchMarkers();
+      browser.runtime.onMessage.removeListener(answerAlive);
       invalidateProcessedIdCache();
       unsupportedThingIds.clear();
     });

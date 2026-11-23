@@ -38,6 +38,7 @@ import {
   massDownloadScrollUp as massDownloadScrollUpStorage,
 } from "@/utils/storage";
 import { MemoryPanel } from "@/components/memory-panel";
+import { sendToTab } from "@/utils/tab-messaging";
 import { PresetsPanel } from "@/components/presets-panel";
 import { HistoryPanel } from "@/components/history-panel";
 import { autoImportPresets } from "@/utils/presets";
@@ -163,7 +164,7 @@ const waitForContentScript = async (tabId: number) => {
   let lastError: unknown;
   while (Date.now() < deadline) {
     try {
-      const pong = await sendMessage(
+      const pong = await sendToTab(
         "PING",
         undefined,
         `content-script@${tabId}`,
@@ -778,7 +779,7 @@ function SidebarApp() {
        */
       const releaseFinishedPost = (mediaPostId: string) => {
         if (!freeMemory) return;
-        void sendMessage(
+        void sendToTab(
           "RELEASE_POST",
           { mediaPostId, remove: !scrollingUp },
           `content-script@${tab.id}`,
@@ -813,7 +814,7 @@ function SidebarApp() {
 
         if (scrollUp) {
           try {
-            const anchorRes = await sendMessage(
+            const anchorRes = await sendToTab(
               "GET_CURRENT_POST_ID",
               undefined,
               `content-script@${tab.id}`,
@@ -828,7 +829,7 @@ function SidebarApp() {
         }
 
         // Ask content script to scan for media using webext-bridge
-        const response = await sendMessage(
+        const response = await sendToTab(
           "SCAN_PAGE_MEDIA",
           scanPayload,
           `content-script@${tab.id}`,
@@ -946,7 +947,7 @@ function SidebarApp() {
             });
 
             try {
-              await sendMessage(
+              await sendToTab(
                 "HIGHLIGHT_CURRENT_POST",
                 {
                   mediaPostId: mediaItem.mediaPostId,
@@ -992,7 +993,7 @@ function SidebarApp() {
 
               if (form.getValues("markDownloadedAsVisited")) {
                 try {
-                  await sendMessage(
+                  await sendToTab(
                     "MARK_POST_VISITED",
                     { mediaPostId: mediaItem.mediaPostId },
                     `content-script@${tab.id}`,
@@ -1114,7 +1115,7 @@ function SidebarApp() {
           keepWatching: watch,
           processBatch: () => processOneBatch(scrollUp),
           scrollForMore: async () => {
-            const scroll = await sendMessage(
+            const scroll = await sendToTab(
               "SCROLL_TO_LOAD_MORE",
               { scrollUp },
               `content-script@${tab.id}`,
