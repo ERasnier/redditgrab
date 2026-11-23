@@ -53,6 +53,8 @@ export interface ScrollToLoadMoreResponse {
 
 export interface PingResponse {
   success: boolean;
+  /** Different on every page load. */
+  instance: string;
   url: string;
   posts: number;
   layout: "feed" | "search" | "old-reddit";

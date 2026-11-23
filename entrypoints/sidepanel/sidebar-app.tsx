@@ -39,6 +39,7 @@ import {
 } from "@/utils/storage";
 import { MemoryPanel } from "@/components/memory-panel";
 import { sendToTab } from "@/utils/tab-messaging";
+import { navigateTab, reloadTab } from "@/utils/tab-navigation";
 import { PresetsPanel } from "@/components/presets-panel";
 import { HistoryPanel } from "@/components/history-panel";
 import { autoImportPresets } from "@/utils/presets";
@@ -106,144 +107,6 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
  * the end of a listing is normal — so a single miss isn't proof.
  */
 const EMPTY_SCROLLS_BEFORE_DONE = 3;
-
-/** Longest to wait for a navigation to finish loading. */
-const NAV_LOAD_TIMEOUT_MS = 45_000;
-/** Longest to wait for the content script to answer on the new page. */
-const NAV_READY_TIMEOUT_MS = 20_000;
-
-/**
- * Wait until the tab has finished loading the page we asked for.
- *
- * Checking only for `status === "complete"` isn't enough: for a moment after
- * `tabs.update` the tab still reports the *previous* page as complete, so a
- * naive check returns at once and the scan runs against the page we were trying
- * to leave. Require the URL to have actually moved as well — either to the
- * target, or somewhere else if Reddit redirected us.
- */
-const waitForTabLoad = async (
-  tabId: number,
-  targetUrl: string,
-  previousUrl: string | undefined,
-) => {
-  const deadline = Date.now() + NAV_LOAD_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    await sleep(300);
-    let tab: Browser.tabs.Tab;
-    try {
-      tab = await browser.tabs.get(tabId);
-    } catch {
-      // The tab was closed under us; nothing left to download into.
-      throw new Error("the tab was closed");
-    }
-    if (tab.status !== "complete" || !tab.url) continue;
-
-    const arrived = isSameRedditPage(tab.url, targetUrl);
-    const movedOn = !previousUrl || tab.url !== previousUrl;
-    if (arrived || movedOn) {
-      if (!arrived) {
-        logger.warn(`Expected ${targetUrl} but landed on ${tab.url}`);
-      }
-      return tab.url;
-    }
-  }
-  throw new Error(
-    `page did not finish loading within ${NAV_LOAD_TIMEOUT_MS / 1000}s`,
-  );
-};
-
-/**
- * Wait for the content script to respond on the newly loaded page.
- *
- * A freshly navigated tab accepts messages only once the content script has
- * been injected and registered its handlers; scanning before then fails with a
- * confusing bridge error, so poll a cheap PING until it answers.
- */
-const waitForContentScript = async (tabId: number) => {
-  const deadline = Date.now() + NAV_READY_TIMEOUT_MS;
-  let lastError: unknown;
-  while (Date.now() < deadline) {
-    try {
-      const pong = await sendToTab(
-        "PING",
-        undefined,
-        `content-script@${tabId}`,
-      );
-      if (pong?.success) return pong;
-    } catch (error) {
-      lastError = error;
-    }
-    await sleep(500);
-  }
-  throw new Error(
-    `content script did not respond within ${NAV_READY_TIMEOUT_MS / 1000}s${
-      lastError ? ` (${String(lastError)})` : ""
-    }`,
-  );
-};
-
-/**
- * Point the tab at a queued URL and wait until it is ready to be scanned.
- * Skips the navigation when the tab is already on that page, so starting a
- * queue whose first entry is the current page doesn't pointlessly reload it.
- */
-const navigateTab = async (tabId: number, url: string) => {
-  let current: Browser.tabs.Tab | undefined;
-  try {
-    current = await browser.tabs.get(tabId);
-  } catch {
-    throw new Error("the tab was closed");
-  }
-
-  if (current?.url && isSameRedditPage(current.url, url)) {
-    logger.log(`Already on ${url}, not reloading`);
-    await waitForContentScript(tabId);
-    return;
-  }
-
-  await browser.tabs.update(tabId, { url });
-  await waitForTabLoad(tabId, url, current?.url);
-  const pong = await waitForContentScript(tabId);
-  logger.log(
-    `Opened ${pong.url} (${pong.layout} layout, ${pong.posts} posts on screen)`,
-  );
-};
-
-/**
- * Reload the tab in place and wait until the fresh page can be scanned.
- *
- * `navigateTab` can't do this: it needs the URL to change to know the new page
- * has arrived, and a reload keeps the URL. Instead wait to see the tab start
- * loading, then finish, then for the new content script to answer.
- */
-const reloadTab = async (tabId: number) => {
-  await browser.tabs.reload(tabId);
-
-  // The reload may already be under way, or (rarely) already done, by the time
-  // we look; give it a moment to show as loading rather than racing it.
-  const sawLoadingBy = Date.now() + 5_000;
-  while (Date.now() < sawLoadingBy) {
-    const tab = await browser.tabs.get(tabId).catch(() => null);
-    if (!tab) throw new Error("the tab was closed");
-    if (tab.status === "loading") break;
-    await sleep(100);
-  }
-
-  const deadline = Date.now() + NAV_LOAD_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-    const tab = await browser.tabs.get(tabId).catch(() => null);
-    if (!tab) throw new Error("the tab was closed");
-    if (tab.status === "complete") {
-      const pong = await waitForContentScript(tabId);
-      logger.log(`Reloaded ${pong.url} (${pong.posts} posts on screen)`);
-      return;
-    }
-    await sleep(300);
-  }
-  throw new Error(
-    `page did not finish reloading within ${NAV_LOAD_TIMEOUT_MS / 1000}s`,
-  );
-};
 
 const debouncedSaveFolder = debounce(async (value: string) => {
   await folderDestinationStorage.setValue(value);
@@ -617,6 +480,17 @@ function SidebarApp() {
 
   // Ref to control continuous processing loop
   const shouldContinueProcessingRef = useRef(false);
+  /**
+   * Which run is the current one. Each start takes the next number, and a
+   * run's loop only carries on while it is still the current one.
+   *
+   * Stop used to clear the flag above and show the Start button at once, but
+   * the loop only notices at the end of its current step, which can take a
+   * minute. Starting again inside that window set the flag back — and the old
+   * loop carried on beside the new one, both driving the same tab (the
+   * interleaved [1/125] and [101/125] lines in the run logs of 23 Nov).
+   */
+  const runGenerationRef = useRef(0);
 
   /**
    * Every post this run did not download, with the reason. Accumulated across
@@ -700,6 +574,12 @@ function SidebarApp() {
   const handledThisRunRef = useRef<Set<string>>(new Set());
 
   const handleMassScrape = async (resume?: SavedQueueRun) => {
+    const myRun = ++runGenerationRef.current;
+    /** True while this run should keep going: not stopped, not superseded. */
+    const alive = () =>
+      shouldContinueProcessingRef.current && runGenerationRef.current === myRun;
+    /** Whether this run is still the current one, so it may close itself out. */
+    const isCurrent = () => runGenerationRef.current === myRun;
     try {
       const [tab] = await browser.tabs.query({
         active: true,
@@ -770,6 +650,32 @@ function SidebarApp() {
       const freeMemory = await freeMemoryDuringRunsStorage.getValue();
       /** Whether the page is being walked upwards right now. */
       let scrollingUp = false;
+
+      /**
+       * Downloads in a row that Firefox couldn't write to disk. On 22 Nov the
+       * drive filled up mid-run: from then on every file failed with
+       * FILE_FAILED, and the run spent five hours failing post after post.
+       * Past this many in a row, the run stops and says why.
+       */
+      const WRITE_FAILURE_LIMIT = 10;
+      let writeFailureStreak = 0;
+      const WRITE_FAILURE =
+        /FILE_FAILED|FILE_NO_SPACE|FILE_TOO_LARGE|FILE_ACCESS_DENIED|QuotaExceeded|quota/i;
+      const noteWriteOutcome = (message: string | null) => {
+        if (message === null || !WRITE_FAILURE.test(message)) {
+          writeFailureStreak = 0;
+          return;
+        }
+        writeFailureStreak += 1;
+        if (writeFailureStreak >= WRITE_FAILURE_LIMIT && alive()) {
+          stopReasonRef.current =
+            `Stopped: Firefox couldn't save ${writeFailureStreak} files in a row (${message.match(WRITE_FAILURE)?.[0]}). ` +
+            "The drive may be full, or the download folder unwritable. Free some space or check the folder, then resume the page list.";
+          logger.error(stopReasonRef.current);
+          void logRunNote(stopReasonRef.current);
+          shouldContinueProcessingRef.current = false;
+        }
+      };
 
       /**
        * Let go of a post the moment its download has finished, whether it
@@ -915,7 +821,7 @@ function SidebarApp() {
         for (let i = 0; i < filteredMediaUrls.length; i++) {
           const mediaItem = filteredMediaUrls[i];
 
-          if (!shouldContinueProcessingRef.current) {
+          if (!alive()) {
             logger.log("Processing stopped by user");
             break;
           }
@@ -990,6 +896,7 @@ function SidebarApp() {
               // instead of rewriting the whole id array per download.
               await addProcessedPostId(mediaItem.mediaPostId);
               releaseFinishedPost(mediaItem.mediaPostId);
+              noteWriteOutcome(null);
 
               if (form.getValues("markDownloadedAsVisited")) {
                 try {
@@ -1014,6 +921,7 @@ function SidebarApp() {
               failedPostIdsRef.current.add(mediaItem.mediaPostId);
               releaseFinishedPost(mediaItem.mediaPostId);
               recordFailure(mediaItem.mediaPostId, reason);
+              noteWriteOutcome(message);
               countReasons({ [reason]: 1 });
               void logRunFailure({
                 postId: mediaItem.mediaPostId,
@@ -1058,6 +966,7 @@ function SidebarApp() {
             failedPostIdsRef.current.add(mediaItem.mediaPostId);
             releaseFinishedPost(mediaItem.mediaPostId);
             recordFailure(mediaItem.mediaPostId, "download-threw");
+            noteWriteOutcome(message);
             countReasons({ "download-threw": 1 });
             void logRunFailure({
               postId: mediaItem.mediaPostId,
@@ -1122,7 +1031,7 @@ function SidebarApp() {
             );
             return { grew: scroll?.grew === true };
           },
-          shouldContinue: () => shouldContinueProcessingRef.current,
+          shouldContinue: () => alive(),
           sleep,
           log: (message) => {
             logger.always(message);
@@ -1148,6 +1057,12 @@ function SidebarApp() {
         });
 
       const finish = async (note: string, reason: string) => {
+        // A run that was superseded leaves the new one alone: no flag
+        // cleared, no log closed, nothing reset under it.
+        if (!isCurrent()) {
+          logger.always(`An earlier run wound down after a newer one started (${reason})`);
+          return;
+        }
         shouldContinueProcessingRef.current = false;
         await endRun(note, reason);
       };
@@ -1232,7 +1147,7 @@ function SidebarApp() {
       await saveProgress();
 
       for (let index = 0; index < queue.length; index++) {
-        if (!shouldContinueProcessingRef.current) break;
+        if (!alive()) break;
         if (statuses[index] === "done") continue;
 
         const entry = queue[index];
@@ -1266,7 +1181,7 @@ function SidebarApp() {
           continue;
         }
 
-        if (!shouldContinueProcessingRef.current) {
+        if (!alive()) {
           await setStatus(index, "pending");
           break;
         }
@@ -1293,7 +1208,7 @@ function SidebarApp() {
         }
       }
 
-      const completed = shouldContinueProcessingRef.current;
+      const completed = alive();
       // Keep the saved progress while anything is left to do — a stopped run,
       // or pages that failed to open — so it can be resumed. A list that got
       // all the way through is cleared.
@@ -1324,6 +1239,7 @@ function SidebarApp() {
       // the run log stayed "in progress" with no reason given.
       const message = error instanceof Error ? error.message : String(error);
       logger.error("The run stopped because of an error:", error);
+      if (!isCurrent()) return;
       shouldContinueProcessingRef.current = false;
       await endRun(
         "Processing stopped by an error.",

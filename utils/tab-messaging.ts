@@ -24,6 +24,8 @@ import { sendMessage } from "webext-bridge/popup";
 
 /** Sent through browser.tabs.sendMessage; the content script answers true. */
 export const ALIVE_MESSAGE = "redditgrab:alive";
+/** A call to one of the content script's handlers: { type, name, data }. */
+export const CALL_MESSAGE = "redditgrab:call";
 
 export class TabUnreachableError extends Error {
   constructor(message: string) {
@@ -50,7 +52,9 @@ const DEFAULT_TIMEOUT_MS = 60_000;
 /** True if the tab has a live RedditGrab content script. Never hangs. */
 export const isContentScriptAlive = async (tabId: number) => {
   try {
-    return (await browser.tabs.sendMessage(tabId, { type: ALIVE_MESSAGE })) === true;
+    return (
+      (await browser.tabs.sendMessage(tabId, { type: ALIVE_MESSAGE }, { frameId: 0 })) === true
+    );
   } catch {
     // "Receiving end does not exist", a closed tab, a discarded tab.
     return false;
@@ -63,25 +67,38 @@ const tabIdOf = (destination: unknown) => {
 };
 
 /**
- * sendMessage for content-script destinations: same arguments, but it fails
- * straight away when the tab has no content script, and fails after a time
- * limit instead of waiting for ever.
+ * Call a content-script handler on a tab, through Firefox's own messaging.
+ *
+ * These calls used to go through webext-bridge. Besides parking messages to a
+ * missing page for good (above), it stopped delivering to pages the run had
+ * just opened: run logs from 23 Nov show page after page where the content
+ * script answered Firefox's own messaging at once yet never received the
+ * bridge's PING. Firefox's messaging goes straight to the page's current
+ * document, fails immediately when nothing is listening, and needs no
+ * connection to be set up first.
+ *
+ * Same arguments as webext-bridge's sendMessage, so call sites read the same.
  */
 export const sendToTab = (async (messageID: string, data: unknown, destination: unknown) => {
   const tabId = tabIdOf(destination);
   if (tabId === null) {
     return (sendMessage as (...args: unknown[]) => Promise<unknown>)(messageID, data, destination);
   }
-  if (!(await isContentScriptAlive(tabId))) {
-    throw new TabUnreachableError(
-      `the page isn't answering (${messageID}): it has no RedditGrab content script — it may have been unloaded, reloaded, closed, or opened before the extension was reloaded`,
-    );
-  }
   const limit = TIMEOUTS_MS[messageID] ?? DEFAULT_TIMEOUT_MS;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      (sendMessage as (...args: unknown[]) => Promise<unknown>)(messageID, data, destination),
+      browser.tabs
+        .sendMessage(tabId, { type: CALL_MESSAGE, name: messageID, data }, { frameId: 0 })
+        .catch((error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          if (/Receiving end does not exist|Could not establish connection|No tab with id|Invalid tab/i.test(message)) {
+            throw new TabUnreachableError(
+              `the page isn't answering (${messageID}): it has no RedditGrab content script — it may still be loading, or have been unloaded, reloaded or closed`,
+            );
+          }
+          throw error;
+        }),
       new Promise<never>((_, reject) => {
         timer = setTimeout(
           () =>

@@ -1,6 +1,6 @@
 import { addTextToImage, addTextToVideo } from "./text-overlays";
 import { logger } from "./logger";
-import { redGifsIdFromPlaylistUrl, resolveRedGifsMp4 } from "./redgifs-api";
+import { RedGifsApiError, redGifsIdFromPlaylistUrl, resolveRedGifsMp4 } from "./redgifs-api";
 import {
   createBlobUrl,
   downloadAndRelease,
@@ -473,6 +473,12 @@ const getRedGifsSourceUrl = async (playlistUrl: string): Promise<string> => {
       return await resolveRedGifsMp4(id);
     } catch (error) {
       apiFailure = error instanceof Error ? error.message : String(error);
+      // 410 Gone is RedGIFs saying the gif was deleted. In the run logs every
+      // such gif then failed the playlist too (403/404 on its segments), after
+      // starting ffmpeg for nothing — so don't try.
+      if (error instanceof RedGifsApiError && error.status === 410) {
+        throw new Error(`RedGIFs has removed this gif (410 Gone): ${apiFailure}`);
+      }
       logger.warn(`RedGIFs API failed, trying the HLS playlist: ${apiFailure}`);
     }
   }

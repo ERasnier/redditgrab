@@ -3,7 +3,16 @@ import ReactDOM from "react-dom/client";
 import type { MediaContentType } from "~/types";
 import DownloadButton from "@/components/download-button";
 import OldRedditDownloadButton from "@/components/old-reddit-download-button";
-import { onMessage } from "webext-bridge/content-script";
+// Calls from the sidebar arrive through Firefox's own messaging (see
+// utils/tab-messaging.ts), not webext-bridge; this keeps the handler
+// registrations below as they were.
+type PageHandler = (message: { data: any }) => unknown;
+const pageHandlers = new Map<string, PageHandler>();
+const onMessage = (name: string, handler: PageHandler) => {
+  pageHandlers.set(name, handler);
+};
+/** Different on every page load, so the sidebar can tell a new page from the old. */
+const pageInstance = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 import { Selectors } from "@/utils/constants";
 import {
   processedPostIds,
@@ -16,7 +25,7 @@ import {
   freeMemoryDuringRuns,
 } from "@/utils/storage";
 import { pruneFinishedPosts, releaseMedia, removePost } from "@/utils/page-pruning";
-import { ALIVE_MESSAGE } from "@/utils/tab-messaging";
+import { ALIVE_MESSAGE, CALL_MESSAGE } from "@/utils/tab-messaging";
 import { compact } from "es-toolkit";
 import { logger, isDebugEnabled } from "@/utils/logger";
 import { parseISO, isValid } from "date-fns";
@@ -758,6 +767,37 @@ export default defineContentScript({
       logger.log(`Attached buttons to ${elements.length} elements`);
     };
 
+    // The sidebar's calls: a liveness check, and the handlers registered with
+    // onMessage. Anything else isn't ours, so it's left unanswered. Set up
+    // before the first await, with PING, so a newly opened page answers the
+    // sidebar as soon as it can.
+    const answerAlive = (message: unknown) => {
+      const call = message as { type?: string; name?: string; data?: unknown } | null;
+      if (call?.type === ALIVE_MESSAGE) return Promise.resolve(true);
+      if (call?.type !== CALL_MESSAGE || typeof call.name !== "string") return undefined;
+      const handler = pageHandlers.get(call.name);
+      if (!handler) {
+        // Still starting up: the sidebar retries.
+        return Promise.reject(new Error(`the page isn't ready for ${call.name} yet`));
+      }
+      return Promise.resolve().then(() => handler({ data: call.data }));
+    };
+    browser.runtime.onMessage.addListener(answerAlive);
+
+    // Lets the sidebar confirm the content script is live on a freshly
+    // navigated page before it starts scanning.
+    onMessage("PING", async () => ({
+      success: true,
+      instance: pageInstance,
+      url: window.location.href,
+      posts: countPostRoots(),
+      layout: isOldReddit()
+        ? ("old-reddit" as const)
+        : isSearchResultsPage()
+          ? ("search" as const)
+          : ("feed" as const),
+    }));
+
     await attachButtons();
     await refreshDownloadedMarkers();
 
@@ -773,14 +813,6 @@ export default defineContentScript({
       refreshDownloadedMarkers();
     });
 
-    // Lets the sidebar check, without the messaging library parking the
-    // request, that this page has a live content script before it sends
-    // anything. See utils/tab-messaging.ts.
-    const answerAlive = (message: unknown) =>
-      (message as { type?: string } | null)?.type === ALIVE_MESSAGE
-        ? Promise.resolve(true)
-        : undefined;
-    browser.runtime.onMessage.addListener(answerAlive);
 
     let scrollTimeout: ReturnType<typeof setTimeout> | undefined;
     const handleScroll = () => {
@@ -1196,17 +1228,5 @@ export default defineContentScript({
       return await scrollAndWaitForMore(scrollUp);
     });
 
-    // Lets the sidebar confirm the content script is live on a freshly
-    // navigated page before it starts scanning.
-    onMessage("PING", async () => ({
-      success: true,
-      url: window.location.href,
-      posts: countPostRoots(),
-      layout: isOldReddit()
-        ? ("old-reddit" as const)
-        : isSearchResultsPage()
-          ? ("search" as const)
-          : ("feed" as const),
-    }));
   },
 });
