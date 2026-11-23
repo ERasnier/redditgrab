@@ -102,6 +102,26 @@ import { processFolderDestination } from "@/utils/post-utils";
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
+ * Longest one post's download may take, end to end, before the run gives up
+ * on it and moves on. Big videos with title overlays are the slow case.
+ */
+const DOWNLOAD_REQUEST_LIMIT_MS = 20 * 60_000;
+
+/** Reject with `message` if `promise` hasn't settled within `ms`. */
+const withTimeLimit = <T,>(ms: number, message: string, promise: Promise<T>) => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    promise,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), ms);
+    }),
+  ]).finally(() => clearTimeout(timer));
+};
+
+/** How long one step may run before the watchdog notes it in the run log. */
+const SLOW_STEP_MS = 2 * 60_000;
+
+/**
  * How many consecutive scrolls may load nothing before a page is treated as
  * finished. Reddit's infinite scroll is intermittent — one quiet scroll near
  * the end of a listing is normal — so a single miss isn't proof.
@@ -493,6 +513,27 @@ function SidebarApp() {
   const runGenerationRef = useRef(0);
 
   /**
+   * What the run is doing right now, for the watchdog. A run that went quiet
+   * used to leave nothing to say what it was waiting on; now any step that
+   * takes over two minutes is written to the run log, again every two
+   * minutes while it lasts.
+   */
+  const stepRef = useRef<{ label: string; since: number; reported: number } | null>(null);
+  const setStep = (label: string) => {
+    stepRef.current = { label, since: Date.now(), reported: 0 };
+  };
+  const checkForSlowStep = () => {
+    const step = stepRef.current;
+    if (!step) return;
+    const now = Date.now();
+    if (now - step.since < SLOW_STEP_MS || now - step.reported < SLOW_STEP_MS) return;
+    step.reported = now;
+    const note = `Still waiting after ${Math.round((now - step.since) / 60_000)} min: ${step.label}`;
+    logger.always(note);
+    void logRunNote(note);
+  };
+
+  /**
    * Every post this run did not download, with the reason. Accumulated across
    * scan passes so a run can be audited afterwards rather than relying on
    * whatever happens to still be in the console.
@@ -644,7 +685,11 @@ function SidebarApp() {
       // A run cut short by the sidebar or Firefox closing can't write why;
       // this shows when it was last alive.
       if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
-      heartbeatTimerRef.current = setInterval(() => void runLogHeartbeat(), 30_000);
+      setStep("starting");
+      heartbeatTimerRef.current = setInterval(() => {
+        void runLogHeartbeat();
+        checkForSlowStep();
+      }, 30_000);
 
       // Read once per run; the checkbox is hidden while a run is going.
       const freeMemory = await freeMemoryDuringRunsStorage.getValue();
@@ -734,7 +779,8 @@ function SidebarApp() {
           }
         }
 
-        // Ask content script to scan for media using webext-bridge
+        // Ask the content script to scan the page for media
+        setStep("scanning the page for posts");
         const response = await sendToTab(
           "SCAN_PAGE_MEDIA",
           scanPayload,
@@ -853,6 +899,7 @@ function SidebarApp() {
             });
 
             try {
+              setStep(`scrolling to ${mediaItem.mediaPostId}`);
               await sendToTab(
                 "HIGHLIGHT_CURRENT_POST",
                 {
@@ -866,8 +913,14 @@ function SidebarApp() {
               logger.warn("Failed to highlight post:", error);
             }
 
-            // Send download request to background script
-            const downloadResponse = await sendMessage(
+            // Send download request to background script. Time-limited: the
+            // background's own steps all have limits now, but a request that
+            // never came back stalled the whole run with nothing logged.
+            setStep(`downloading ${mediaItem.mediaPostId} (${mediaItem.type})`);
+            const downloadResponse = await withTimeLimit(
+              DOWNLOAD_REQUEST_LIMIT_MS,
+              `the download of ${mediaItem.mediaPostId} didn't finish within ${DOWNLOAD_REQUEST_LIMIT_MS / 60_000} minutes`,
+              sendMessage(
               "DOWNLOAD_REQUEST",
               {
                 timestamp: Date.now(),
@@ -884,7 +937,9 @@ function SidebarApp() {
                 savePostArchive: form.getValues("savePostArchive"),
               },
               "background",
+              ),
             );
+            setStep("between downloads");
 
             if (downloadResponse?.success) {
               logger.log(`Download ${i + 1} completed`);
@@ -1018,12 +1073,28 @@ function SidebarApp() {
        * loaded, so an exhausted page can be recognised — which is also what
        * lets the URL queue know when to move on.
        */
-      const runCurrentPage = (scrollUp: boolean, watch = false) =>
-        runPageUntilExhausted({
+      const runCurrentPage = (scrollUp: boolean, watch = false) => {
+        emptyScansOnPage = 0;
+        return runPageUntilExhausted({
           scrollUp,
           keepWatching: watch,
-          processBatch: () => processOneBatch(scrollUp),
+          processBatch: async () => {
+            const result = await processOneBatch(scrollUp);
+            // A subreddit that is already fully downloaded still gets scrolled
+            // to its end, which can take minutes with nothing to show. Say so
+            // in the run log every 10 scans, so a quiet stretch reads as
+            // "nothing new here" rather than as a hang.
+            if (result.queued > 0) {
+              emptyScansOnPage = 0;
+            } else if (++emptyScansOnPage % 10 === 0) {
+              void logRunNote(
+                `Still scrolling: ${emptyScansOnPage} scans in a row on this page found nothing new to download (already downloaded or skipped).`,
+              );
+            }
+            return result;
+          },
           scrollForMore: async () => {
+            setStep("scrolling for more posts");
             const scroll = await sendToTab(
               "SCROLL_TO_LOAD_MORE",
               { scrollUp },
@@ -1051,10 +1122,12 @@ function SidebarApp() {
           refreshPage: watch
             ? async () => {
                 logger.always("Reloading the page to check for new posts.");
+                setStep("reloading the page");
                 await reloadTab(tab.id!);
               }
             : undefined,
         });
+      };
 
       const finish = async (note: string, reason: string) => {
         // A run that was superseded leaves the new one alone: no flag
@@ -1069,6 +1142,8 @@ function SidebarApp() {
 
       /** Why the page in hand finished, as the runner put it. */
       let pageEndReason = "";
+      /** Scans in a row on the current page that queued nothing. */
+      let emptyScansOnPage = 0;
       /** Why a stop happened, falling back to saying it wasn't recorded. */
       const stoppedReason = () =>
         stopReasonRef.current ??
@@ -1171,6 +1246,7 @@ function SidebarApp() {
         );
 
         try {
+          setStep(`opening ${entry.url}`);
           await navigateTab(tab.id, entry.url);
         } catch (error) {
           const message =
@@ -1255,6 +1331,7 @@ function SidebarApp() {
   const endRun = async (note: string, reason: string) => {
     stopReasonRef.current = reason;
     runEndedAtRef.current = Date.now();
+    stepRef.current = null;
     if (heartbeatTimerRef.current) {
       clearInterval(heartbeatTimerRef.current);
       heartbeatTimerRef.current = null;

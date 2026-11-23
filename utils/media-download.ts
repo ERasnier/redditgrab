@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from "./fetch-timeout";
 import { addTextToImage, addTextToVideo } from "./text-overlays";
 import { logger } from "./logger";
 import { RedGifsApiError, redGifsIdFromPlaylistUrl, resolveRedGifsMp4 } from "./redgifs-api";
@@ -428,7 +429,7 @@ export async function downloadVideo(options: DownloadVideoOptions) {
       try {
         logger.log("Adding text overlay to video:", postTitle);
 
-        const response = await fetch(url);
+        const response = await fetchWithTimeout(url, {}, { startMs: 60_000, bodyMs: 15 * 60_000 });
         const videoBlob = await response.blob();
 
         const processedVideoBlob = await addTextToVideo(videoBlob, postTitle);
@@ -650,7 +651,7 @@ async function loadHlsSegments(
   let url = playlistUrl;
 
   for (let depth = 0; depth < MAX_PLAYLIST_DEPTH; depth++) {
-    const response = await fetch(url, { credentials: "include" });
+    const response = await fetchWithTimeout(url, { credentials: "include" });
     if (!response.ok) {
       throw new Error(`Failed to fetch playlist ${url}: ${response.status}`);
     }
@@ -708,7 +709,7 @@ async function downloadHlsSegment(segment: HlsSegment): Promise<Uint8Array> {
     headers.Range = `bytes=${offset}-${offset + segment.byteRange.length - 1}`;
   }
 
-  const response = await fetch(segment.uri, {
+  const response = await fetchWithTimeout(segment.uri, {
     credentials: "include",
     headers,
   });
@@ -741,7 +742,7 @@ async function fetchMediaWithFallback(
   const mp4Url = baseUrl.replace(".m3u8", ".mp4");
 
   try {
-    const response = await fetch(primaryUrl);
+    const response = await fetchWithTimeout(primaryUrl, {}, { startMs: 60_000, bodyMs: 15 * 60_000 });
     if (!response.ok) {
       throw new Error(
         `Failed to fetch ${primaryExtension} file: ${response.status}`,
@@ -750,7 +751,7 @@ async function fetchMediaWithFallback(
     return new Uint8Array(await response.arrayBuffer());
   } catch (error) {
     logger.log(`Failed to fetch ${primaryExtension} file, trying .mp4:`, error);
-    const response = await fetch(mp4Url);
+    const response = await fetchWithTimeout(mp4Url, {}, { startMs: 60_000, bodyMs: 15 * 60_000 });
     if (!response.ok) {
       throw new Error(`Failed to fetch .mp4 file: ${response.status}`);
     }
@@ -828,7 +829,7 @@ type RedditPackagedMedia = {
 };
 
 export const getHighestQualityHLS = async (m3u8Url: string) => {
-  const playlist = await fetch(m3u8Url).then((r) => r.text());
+  const playlist = await fetchWithTimeout(m3u8Url).then((r) => r.text());
 
   const lines = playlist.split("\n");
   let bestVideo: { resolution: number; url: string | null } = {

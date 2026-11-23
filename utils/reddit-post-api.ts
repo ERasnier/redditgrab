@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from "./fetch-timeout";
 import type { MediaContentType } from "@/types";
 import { getHighestQualityHLS } from "./media-download";
 import { logger } from "./logger";
@@ -126,7 +127,7 @@ const MAX_RETRY_AFTER_MS = 30_000;
 const fetchPostJson = async (id: string, extraQuery = "") => {
   const url = `https://www.reddit.com/comments/${id}/.json?raw_json=1${extraQuery}`;
   await waitForRequestSlot();
-  const res = await fetch(url, { credentials: "include" });
+  const res = await fetchWithTimeout(url, { credentials: "include" });
   if (res.status !== 429) return res;
 
   // Rate limited: wait as long as Reddit asks (capped), then retry once.
@@ -138,7 +139,7 @@ const fetchPostJson = async (id: string, extraQuery = "") => {
   logger.warn(`Rate limited fetching ${id}, retrying in ${waitMs}ms`);
   nextRequestAt = Math.max(nextRequestAt, Date.now() + waitMs);
   await waitForRequestSlot();
-  return fetch(url, { credentials: "include" });
+  return fetchWithTimeout(url, { credentials: "include" });
 };
 
 /**

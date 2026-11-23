@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from "./fetch-timeout";
 import { logger } from "./logger";
 
 /**
@@ -42,7 +43,7 @@ const getToken = async (refresh = false): Promise<string> => {
   ) {
     return cachedToken.value;
   }
-  const response = await fetch(`${API}/auth/temporary`);
+  const response = await fetchWithTimeout(`${API}/auth/temporary`);
   if (!response.ok) {
     throw new RedGifsApiError(
       `RedGIFs token request returned ${response.status}`,
@@ -67,7 +68,7 @@ export const resolveRedGifsMp4 = async (id: string): Promise<string> => {
   // The API wants lower case; the embed sometimes gives mixed case.
   const gifId = id.toLowerCase();
   const request = async (token: string) =>
-    fetch(`${API}/gifs/${encodeURIComponent(gifId)}`, {
+    fetchWithTimeout(`${API}/gifs/${encodeURIComponent(gifId)}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
 

@@ -1,3 +1,4 @@
+import { fetchWithTimeout } from "./fetch-timeout";
 import { logger } from "./logger";
 
 /**
@@ -76,7 +77,12 @@ export const fetchMediaBlob = async (url: string): Promise<FetchedMedia> => {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     let response: Response;
     try {
-      response = await fetch(url, { credentials: "include" });
+      // A whole video comes through here, so the body gets a long limit.
+      response = await fetchWithTimeout(
+        url,
+        { credentials: "include" },
+        { startMs: 60_000, bodyMs: 15 * 60_000 },
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       lastError = new MediaFetchError(

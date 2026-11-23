@@ -64,7 +64,22 @@ export const createFFmpeg = async (): Promise<FFmpegSession> => {
   });
 
   try {
-    await ffmpeg.load(FFMPEG_OPTIONS);
+    // Loading starts a worker and compiles the 30MB core; it has no time
+    // limit of its own, and a load that never finished stalled the run.
+    let loadTimer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        ffmpeg.load(FFMPEG_OPTIONS),
+        new Promise<never>((_, reject) => {
+          loadTimer = setTimeout(
+            () => reject(new Error("ffmpeg did not finish loading within 90s")),
+            90_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(loadTimer);
+    }
   } catch (error) {
     // Callers only terminate a session they got back, so a failed load used to
     // leave its worker — and the wasm heap it had started — running.
