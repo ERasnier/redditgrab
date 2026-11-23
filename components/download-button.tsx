@@ -11,7 +11,7 @@ import {
 } from "@/utils/storage";
 import { getPostIdentifier } from "@/utils/post-identifier";
 import { markPostAsVisited } from "@/utils/mark-visited";
-import { sendMessage } from "webext-bridge/content-script";
+import { sendMessage } from "@/utils/messaging";
 import { Button } from "@/components/ui/button";
 import { Icon } from "@iconify/react";
 import {

@@ -1,6 +1,6 @@
 import { logger } from "./logger";
 import { logRunNote } from "./run-log";
-import { sendToTab } from "./tab-messaging";
+import { sendToTab } from "./messaging";
 import { isSameRedditPage } from "./url-queue";
 
 /**
@@ -50,6 +50,11 @@ export const waitForPage = async (
     const pong = await pingTab(tabId);
     if (pong) {
       lastSeen = `the page answered from ${pong.url}`;
+      if (pong.ready === false) {
+        lastSeen = `the page at ${pong.url} is still starting up`;
+        await sleep(500);
+        continue;
+      }
       const fresh = !notInstance || pong.instance !== notInstance;
       const there = !targetUrl || isSameRedditPage(pong.url, targetUrl);
       if (fresh && there) return pong;

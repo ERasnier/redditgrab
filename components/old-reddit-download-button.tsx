@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { sendMessage } from "webext-bridge/content-script";
+import { sendMessage } from "@/utils/messaging";
 import {
   folderDestination as folderDestinationStorage,
   useGalleryFolders as useGalleryFoldersStorage,

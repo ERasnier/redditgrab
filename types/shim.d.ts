@@ -55,6 +55,8 @@ export interface PingResponse {
   success: boolean;
   /** Different on every page load. */
   instance: string;
+  /** True once the page can take every call, including scans. */
+  ready?: boolean;
   url: string;
   posts: number;
   layout: "feed" | "search" | "old-reddit";

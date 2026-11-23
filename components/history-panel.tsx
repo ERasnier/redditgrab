@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { sendMessage } from "webext-bridge/popup";
+import { sendMessage } from "@/utils/messaging";
 import { Button } from "@/components/ui/button";
 import {
   HISTORY_FILE_NAME,

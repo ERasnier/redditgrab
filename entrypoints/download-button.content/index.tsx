@@ -4,13 +4,9 @@ import type { MediaContentType } from "~/types";
 import DownloadButton from "@/components/download-button";
 import OldRedditDownloadButton from "@/components/old-reddit-download-button";
 // Calls from the sidebar arrive through Firefox's own messaging (see
-// utils/tab-messaging.ts), not webext-bridge; this keeps the handler
-// registrations below as they were.
-type PageHandler = (message: { data: any }) => unknown;
-const pageHandlers = new Map<string, PageHandler>();
-const onMessage = (name: string, handler: PageHandler) => {
-  pageHandlers.set(name, handler);
-};
+// utils/messaging.ts); onMessage registers the handlers they reach.
+/** Set once every handler the sidebar calls is registered. */
+let handlersReady = false;
 /** Different on every page load, so the sidebar can tell a new page from the old. */
 const pageInstance = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 import { Selectors } from "@/utils/constants";
@@ -25,7 +21,7 @@ import {
   freeMemoryDuringRuns,
 } from "@/utils/storage";
 import { pruneFinishedPosts, releaseMedia, removePost } from "@/utils/page-pruning";
-import { ALIVE_MESSAGE, CALL_MESSAGE } from "@/utils/tab-messaging";
+import { ALIVE_MESSAGE, CALL_MESSAGE, dispatch, onMessage } from "@/utils/messaging";
 import { compact } from "es-toolkit";
 import { logger, isDebugEnabled } from "@/utils/logger";
 import { parseISO, isValid } from "date-fns";
@@ -775,12 +771,9 @@ export default defineContentScript({
       const call = message as { type?: string; name?: string; data?: unknown } | null;
       if (call?.type === ALIVE_MESSAGE) return Promise.resolve(true);
       if (call?.type !== CALL_MESSAGE || typeof call.name !== "string") return undefined;
-      const handler = pageHandlers.get(call.name);
-      if (!handler) {
-        // Still starting up: the sidebar retries.
-        return Promise.reject(new Error(`the page isn't ready for ${call.name} yet`));
-      }
-      return Promise.resolve().then(() => handler({ data: call.data }));
+      // A handler not registered yet means the page is still starting up;
+      // the sidebar retries.
+      return dispatch(call.name, call.data);
     };
     browser.runtime.onMessage.addListener(answerAlive);
 
@@ -788,6 +781,10 @@ export default defineContentScript({
     // navigated page before it starts scanning.
     onMessage("PING", async () => ({
       success: true,
+      // PING answers from early in start-up so a new page is seen quickly,
+      // but the run must wait for this before scanning: on 23 Nov a scan sent
+      // as soon as PING answered found its handler not registered yet.
+      ready: handlersReady,
       instance: pageInstance,
       url: window.location.href,
       posts: countPostRoots(),
@@ -1228,5 +1225,7 @@ export default defineContentScript({
       return await scrollAndWaitForMore(scrollUp);
     });
 
+    // Every handler is registered: PING may now tell the sidebar to go ahead.
+    handlersReady = true;
   },
 });

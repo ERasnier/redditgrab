@@ -20,7 +20,7 @@ import {
   darkMode as darkModeStorage,
 } from "@/utils/storage";
 import { debounce } from "es-toolkit";
-import { sendMessage } from "webext-bridge/popup";
+import { sendMessage } from "@/utils/messaging";
 import { useScrapingProgress } from "./use-scraping-progress";
 import {
   processedPostIds,
@@ -38,7 +38,7 @@ import {
   massDownloadScrollUp as massDownloadScrollUpStorage,
 } from "@/utils/storage";
 import { MemoryPanel } from "@/components/memory-panel";
-import { sendToTab } from "@/utils/tab-messaging";
+import { sendToTab } from "@/utils/messaging";
 import { navigateTab, reloadTab } from "@/utils/tab-navigation";
 import { PresetsPanel } from "@/components/presets-panel";
 import { HistoryPanel } from "@/components/history-panel";

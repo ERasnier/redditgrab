@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { sendMessage } from "webext-bridge/popup";
+import { sendMessage } from "@/utils/messaging";
 import type { PageStats } from "@/types/shim";
-import { sendToTab } from "@/utils/tab-messaging";
+import { sendToTab } from "@/utils/messaging";
 import type { ExtensionMemoryStats } from "@/utils/memory-stats";
 
 const POLL_MS = 3000;

@@ -1,4 +1,4 @@
-import { onMessage } from "webext-bridge/background";
+import { listenForBackgroundCalls, onMessage } from "@/utils/messaging";
 import { DownloadRequestMessage } from "@/types/shim";
 import type { SkipReason } from "@/utils/diagnostics";
 import { getExtensionMemoryStats } from "@/utils/memory-stats";
@@ -20,6 +20,10 @@ let activeRequests = 0;
 let overlapped = false;
 
 export default defineBackground(() => {
+  // Calls from the sidebar and the download buttons, over Firefox's own
+  // messaging (see utils/messaging.ts). Handlers are registered below.
+  listenForBackgroundCalls();
+
   // A temporarily loaded add-on starts every Firefox session with empty
   // storage. If presets were exported into the extension's folder, put them
   // back before anything reads the settings.
