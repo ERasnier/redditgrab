@@ -150,11 +150,10 @@ function classifyFailure(message: string): SkipReason {
 async function handleDownloadRequest(data: DownloadRequestMessage) {
   logger.log("Processing download request:", data);
 
-  const [tab] = await browser.tabs.query({ active: true, currentWindow: true });
-
-  if (!tab?.id) {
-    throw new Error("No active tab found");
-  }
+  // This used to look up the active tab in the focused window and fail with
+  // "No active tab found" when there wasn't one it could see — as when a
+  // private window had focus, where the extension can't see tabs. The tab was
+  // never used: downloads don't need one.
 
   // A media post that resolved to zero URLs used to fall through every branch
   // below and come back as `{ success: true }`, so it was marked processed and
