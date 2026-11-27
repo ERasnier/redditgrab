@@ -98,6 +98,11 @@ import {
   type MassDownloadMediaFilterValue,
 } from "@/components/mass-download-media-filter";
 import { processFolderDestination } from "@/utils/post-utils";
+import type { ScanPageMediaMessage } from "@/types/shim";
+import { JobPanel } from "@/components/job-panel";
+import { countJob, getJobMeta, nextPending, setStatuses } from "@/utils/job-store";
+import { fetchPostsMedia, INFO_BATCH_SIZE } from "@/utils/reddit-post-api";
+import { getHistoryPostIds } from "@/utils/download-history";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -614,7 +619,13 @@ function SidebarApp() {
   // posts would be re-scanned every cycle and never scroll/stop).
   const handledThisRunRef = useRef<Set<string>>(new Set());
 
-  const handleMassScrape = async (resume?: SavedQueueRun) => {
+  /** Whether the run going now is a large job (the job panel shows its progress). */
+  const [jobRunning, setJobRunning] = useState(false);
+
+  const handleMassScrape = async (
+    resume?: SavedQueueRun,
+    mode: "pages" | "job" = "pages",
+  ) => {
     const myRun = ++runGenerationRef.current;
     /** True while this run should keep going: not stopped, not superseded. */
     const alive = () =>
@@ -632,9 +643,12 @@ function SidebarApp() {
 
       // Entries are resolved up front so a typo surfaces before anything is
       // downloaded rather than halfway through a long run.
-      const parsed = resume
-        ? { entries: resume.entries, errors: [] }
-        : parseUrlQueue(urlQueueInput);
+      const parsed =
+        mode === "job"
+          ? { entries: [], errors: [] }
+          : resume
+            ? { entries: resume.entries, errors: [] }
+            : parseUrlQueue(urlQueueInput);
       const { entries: queue, errors: queueErrors } = parsed;
       if (queueErrors.length > 0) {
         logger.error(
@@ -677,8 +691,11 @@ function SidebarApp() {
         }
         setUnfinishedRun(null);
       }
+      const jobMeta = mode === "job" ? await getJobMeta() : null;
       await startRunLog(
-        queue.length > 0
+        jobMeta
+          ? `the large job "${jobMeta.name}" (${jobMeta.total.toLocaleString()} posts, from ${jobMeta.source})`
+          : queue.length > 0
           ? `a page list of ${queue.length} page(s), starting ${queue[0].url}`
           : (tab.url ?? "the current tab"),
       );
@@ -737,6 +754,209 @@ function SidebarApp() {
         ).catch((error) =>
           logger.warn(`Could not release post ${mediaPostId}:`, error),
         );
+      };
+
+      /**
+       * Download a list of posts one by one, with the pause between them.
+       * `onPage` is false for a large job, where the posts aren't on the
+       * tab's page, so there's nothing to scroll to, mark or remove.
+       * Returns which posts downloaded and which failed (and why); anything
+       * in neither was not reached because the run stopped.
+       */
+      const downloadItems = async (
+        items: ScanPageMediaMessage["data"]["mediaUrls"],
+        onPage: boolean,
+      ) => {
+        const succeeded = new Set<string>();
+        const failed = new Map<string, string>();
+          // Process downloads similar to download-button.tsx
+          for (let i = 0; i < items.length; i++) {
+            const mediaItem = items[i];
+
+            if (!alive()) {
+              logger.log("Processing stopped by user");
+              break;
+            }
+
+            try {
+              // Calculate folder destination with variable substitution
+              const currentFolderDestination =
+                form.getValues("folderDestination");
+              const finalFolderDestination = processFolderDestination(
+                currentFolderDestination,
+                null, // No post element available in sidebar
+                mediaItem.subredditName,
+                mediaItem.postDate,
+                mediaItem.postAuthor,
+                mediaItem.postTitle,
+              );
+
+              logger.log(
+                `Downloading ${i + 1}/${items.length}: ${
+                  mediaItem.type
+                } with ${mediaItem.urls.length} URLs`,
+              );
+
+              // Update current post info and highlight
+              setCurrentPostInfo({
+                index: i + 1,
+                type: mediaItem.type,
+                subreddit: mediaItem.subredditName,
+              });
+
+              if (onPage) try {
+                setStep(`scrolling to ${mediaItem.mediaPostId}`);
+                await sendToTab(
+                  "HIGHLIGHT_CURRENT_POST",
+                  {
+                    mediaPostId: mediaItem.mediaPostId,
+                    subredditName: mediaItem.subredditName,
+                    mediaType: mediaItem.type,
+                  },
+                  `content-script@${tab.id}`,
+                );
+              } catch (error) {
+                logger.warn("Failed to highlight post:", error);
+              }
+
+              // Send download request to background script. Time-limited: the
+              // background's own steps all have limits now, but a request that
+              // never came back stalled the whole run with nothing logged.
+              setStep(`downloading ${mediaItem.mediaPostId} (${mediaItem.type})`);
+              const downloadResponse = await withTimeLimit(
+                DOWNLOAD_REQUEST_LIMIT_MS,
+                `the download of ${mediaItem.mediaPostId} didn't finish within ${DOWNLOAD_REQUEST_LIMIT_MS / 60_000} minutes`,
+                sendMessage(
+                "DOWNLOAD_REQUEST",
+                {
+                  timestamp: Date.now(),
+                  mediaContentType: mediaItem.type,
+                  urls: mediaItem.urls,
+                  folderDestination: finalFolderDestination,
+                  subredditName: mediaItem.subredditName,
+                  useGalleryFolders: form.getValues("useGalleryFolders"),
+                  addTitleToImages: form.getValues("addTitleToImages"),
+                  addTitleToVideos: form.getValues("addTitleToVideos"),
+                  postTitle: mediaItem.postTitle,
+                  postAuthor: mediaItem.postAuthor,
+                  postId: mediaItem.mediaPostId,
+                  savePostArchive: form.getValues("savePostArchive"),
+                },
+                "background",
+                ),
+              );
+              setStep("between downloads");
+
+              if (downloadResponse?.success) {
+                logger.log(`Download ${i + 1} completed`);
+                incrementDownloadCount();
+                downloadedCountRef.current += 1;
+                void noteDownloaded(downloadedCountRef.current);
+
+                // Mark this post as processed. Buffered and flushed in batches
+                // instead of rewriting the whole id array per download.
+                await addProcessedPostId(mediaItem.mediaPostId);
+                if (onPage) releaseFinishedPost(mediaItem.mediaPostId);
+                noteWriteOutcome(null);
+
+                succeeded.add(mediaItem.mediaPostId);
+                if (onPage && form.getValues("markDownloadedAsVisited")) {
+                  try {
+                    await sendToTab(
+                      "MARK_POST_VISITED",
+                      { mediaPostId: mediaItem.mediaPostId },
+                      `content-script@${tab.id}`,
+                    );
+                  } catch (e) {
+                    logger.warn("Failed to mark post as visited:", e);
+                  }
+                }
+              } else {
+                const message = downloadResponse?.message ?? "no reason given";
+                const reason =
+                  downloadResponse?.reason ?? "download-request-failed";
+                // Always logged, with enough to find the post again.
+                logger.error(
+                  `Download failed for ${mediaItem.mediaPostId} (${mediaItem.type}, r/${mediaItem.subredditName}): ${message}`,
+                  permalinkForPostId(mediaItem.mediaPostId) ?? "",
+                );
+                failedPostIdsRef.current.add(mediaItem.mediaPostId);
+                failed.set(mediaItem.mediaPostId, message);
+                if (onPage) releaseFinishedPost(mediaItem.mediaPostId);
+                recordFailure(mediaItem.mediaPostId, reason);
+                noteWriteOutcome(message);
+                countReasons({ [reason]: 1 });
+                void logRunFailure({
+                  postId: mediaItem.mediaPostId,
+                  stage: "download",
+                  reason,
+                  detail: message,
+                  title: mediaItem.postTitle,
+                  subreddit: mediaItem.subredditName,
+                  permalink: permalinkForPostId(mediaItem.mediaPostId),
+                  at: Date.now(),
+                });
+                pushDiagnostics([
+                  {
+                    postId: mediaItem.mediaPostId,
+                    stage: "download",
+                    reason,
+                    detail: message,
+                    title: mediaItem.postTitle,
+                    subreddit: mediaItem.subredditName,
+                    permalink: permalinkForPostId(mediaItem.mediaPostId),
+                    at: Date.now(),
+                  },
+                ]);
+              }
+
+              // Pause between downloads so Reddit doesn't rate limit the page
+              if (i < items.length - 1) {
+                const delaySeconds = form.getValues("requestDelaySeconds");
+                const delayMs =
+                  Number.isFinite(delaySeconds) && delaySeconds >= 0
+                    ? delaySeconds * 1000
+                    : 1000;
+                await new Promise((resolve) => setTimeout(resolve, delayMs));
+              }
+            } catch (error) {
+              const message =
+                error instanceof Error ? error.message : String(error);
+              logger.error(
+                `Download threw for ${mediaItem.mediaPostId} (${mediaItem.type}, r/${mediaItem.subredditName}): ${message}`,
+                permalinkForPostId(mediaItem.mediaPostId) ?? "",
+              );
+              failedPostIdsRef.current.add(mediaItem.mediaPostId);
+              failed.set(mediaItem.mediaPostId, message);
+              if (onPage) releaseFinishedPost(mediaItem.mediaPostId);
+              recordFailure(mediaItem.mediaPostId, "download-threw");
+              noteWriteOutcome(message);
+              countReasons({ "download-threw": 1 });
+              void logRunFailure({
+                postId: mediaItem.mediaPostId,
+                stage: "download",
+                reason: "download-threw",
+                detail: message,
+                title: mediaItem.postTitle,
+                subreddit: mediaItem.subredditName,
+                permalink: permalinkForPostId(mediaItem.mediaPostId),
+                at: Date.now(),
+              });
+              pushDiagnostics([
+                {
+                  postId: mediaItem.mediaPostId,
+                  stage: "download",
+                  reason: "download-threw",
+                  detail: message,
+                  title: mediaItem.postTitle,
+                  subreddit: mediaItem.subredditName,
+                  permalink: permalinkForPostId(mediaItem.mediaPostId),
+                  at: Date.now(),
+                },
+              ]);
+            }
+          }
+        return { succeeded, failed };
       };
 
       /**
@@ -863,190 +1083,7 @@ function SidebarApp() {
         setCurrentBatchCount(filteredMediaUrls.length);
         addToTotalPostsFound(filteredMediaUrls.length);
 
-        // Process downloads similar to download-button.tsx
-        for (let i = 0; i < filteredMediaUrls.length; i++) {
-          const mediaItem = filteredMediaUrls[i];
-
-          if (!alive()) {
-            logger.log("Processing stopped by user");
-            break;
-          }
-
-          try {
-            // Calculate folder destination with variable substitution
-            const currentFolderDestination =
-              form.getValues("folderDestination");
-            const finalFolderDestination = processFolderDestination(
-              currentFolderDestination,
-              null, // No post element available in sidebar
-              mediaItem.subredditName,
-              mediaItem.postDate,
-              mediaItem.postAuthor,
-              mediaItem.postTitle,
-            );
-
-            logger.log(
-              `Downloading ${i + 1}/${filteredMediaUrls.length}: ${
-                mediaItem.type
-              } with ${mediaItem.urls.length} URLs`,
-            );
-
-            // Update current post info and highlight
-            setCurrentPostInfo({
-              index: i + 1,
-              type: mediaItem.type,
-              subreddit: mediaItem.subredditName,
-            });
-
-            try {
-              setStep(`scrolling to ${mediaItem.mediaPostId}`);
-              await sendToTab(
-                "HIGHLIGHT_CURRENT_POST",
-                {
-                  mediaPostId: mediaItem.mediaPostId,
-                  subredditName: mediaItem.subredditName,
-                  mediaType: mediaItem.type,
-                },
-                `content-script@${tab.id}`,
-              );
-            } catch (error) {
-              logger.warn("Failed to highlight post:", error);
-            }
-
-            // Send download request to background script. Time-limited: the
-            // background's own steps all have limits now, but a request that
-            // never came back stalled the whole run with nothing logged.
-            setStep(`downloading ${mediaItem.mediaPostId} (${mediaItem.type})`);
-            const downloadResponse = await withTimeLimit(
-              DOWNLOAD_REQUEST_LIMIT_MS,
-              `the download of ${mediaItem.mediaPostId} didn't finish within ${DOWNLOAD_REQUEST_LIMIT_MS / 60_000} minutes`,
-              sendMessage(
-              "DOWNLOAD_REQUEST",
-              {
-                timestamp: Date.now(),
-                mediaContentType: mediaItem.type,
-                urls: mediaItem.urls,
-                folderDestination: finalFolderDestination,
-                subredditName: mediaItem.subredditName,
-                useGalleryFolders: form.getValues("useGalleryFolders"),
-                addTitleToImages: form.getValues("addTitleToImages"),
-                addTitleToVideos: form.getValues("addTitleToVideos"),
-                postTitle: mediaItem.postTitle,
-                postAuthor: mediaItem.postAuthor,
-                postId: mediaItem.mediaPostId,
-                savePostArchive: form.getValues("savePostArchive"),
-              },
-              "background",
-              ),
-            );
-            setStep("between downloads");
-
-            if (downloadResponse?.success) {
-              logger.log(`Download ${i + 1} completed`);
-              incrementDownloadCount();
-              downloadedCountRef.current += 1;
-              void noteDownloaded(downloadedCountRef.current);
-
-              // Mark this post as processed. Buffered and flushed in batches
-              // instead of rewriting the whole id array per download.
-              await addProcessedPostId(mediaItem.mediaPostId);
-              releaseFinishedPost(mediaItem.mediaPostId);
-              noteWriteOutcome(null);
-
-              if (form.getValues("markDownloadedAsVisited")) {
-                try {
-                  await sendToTab(
-                    "MARK_POST_VISITED",
-                    { mediaPostId: mediaItem.mediaPostId },
-                    `content-script@${tab.id}`,
-                  );
-                } catch (e) {
-                  logger.warn("Failed to mark post as visited:", e);
-                }
-              }
-            } else {
-              const message = downloadResponse?.message ?? "no reason given";
-              const reason =
-                downloadResponse?.reason ?? "download-request-failed";
-              // Always logged, with enough to find the post again.
-              logger.error(
-                `Download failed for ${mediaItem.mediaPostId} (${mediaItem.type}, r/${mediaItem.subredditName}): ${message}`,
-                permalinkForPostId(mediaItem.mediaPostId) ?? "",
-              );
-              failedPostIdsRef.current.add(mediaItem.mediaPostId);
-              releaseFinishedPost(mediaItem.mediaPostId);
-              recordFailure(mediaItem.mediaPostId, reason);
-              noteWriteOutcome(message);
-              countReasons({ [reason]: 1 });
-              void logRunFailure({
-                postId: mediaItem.mediaPostId,
-                stage: "download",
-                reason,
-                detail: message,
-                title: mediaItem.postTitle,
-                subreddit: mediaItem.subredditName,
-                permalink: permalinkForPostId(mediaItem.mediaPostId),
-                at: Date.now(),
-              });
-              pushDiagnostics([
-                {
-                  postId: mediaItem.mediaPostId,
-                  stage: "download",
-                  reason,
-                  detail: message,
-                  title: mediaItem.postTitle,
-                  subreddit: mediaItem.subredditName,
-                  permalink: permalinkForPostId(mediaItem.mediaPostId),
-                  at: Date.now(),
-                },
-              ]);
-            }
-
-            // Pause between downloads so Reddit doesn't rate limit the page
-            if (i < filteredMediaUrls.length - 1) {
-              const delaySeconds = form.getValues("requestDelaySeconds");
-              const delayMs =
-                Number.isFinite(delaySeconds) && delaySeconds >= 0
-                  ? delaySeconds * 1000
-                  : 1000;
-              await new Promise((resolve) => setTimeout(resolve, delayMs));
-            }
-          } catch (error) {
-            const message =
-              error instanceof Error ? error.message : String(error);
-            logger.error(
-              `Download threw for ${mediaItem.mediaPostId} (${mediaItem.type}, r/${mediaItem.subredditName}): ${message}`,
-              permalinkForPostId(mediaItem.mediaPostId) ?? "",
-            );
-            failedPostIdsRef.current.add(mediaItem.mediaPostId);
-            releaseFinishedPost(mediaItem.mediaPostId);
-            recordFailure(mediaItem.mediaPostId, "download-threw");
-            noteWriteOutcome(message);
-            countReasons({ "download-threw": 1 });
-            void logRunFailure({
-              postId: mediaItem.mediaPostId,
-              stage: "download",
-              reason: "download-threw",
-              detail: message,
-              title: mediaItem.postTitle,
-              subreddit: mediaItem.subredditName,
-              permalink: permalinkForPostId(mediaItem.mediaPostId),
-              at: Date.now(),
-            });
-            pushDiagnostics([
-              {
-                postId: mediaItem.mediaPostId,
-                stage: "download",
-                reason: "download-threw",
-                detail: message,
-                title: mediaItem.postTitle,
-                subreddit: mediaItem.subredditName,
-                permalink: permalinkForPostId(mediaItem.mediaPostId),
-                at: Date.now(),
-              },
-            ]);
-          }
-        }
+        await downloadItems(filteredMediaUrls, true);
 
         // Make sure buffered processed-ids reach storage at the end of each
         // batch, not only when the buffer happens to fill up.
@@ -1148,6 +1185,135 @@ function SidebarApp() {
       const stoppedReason = () =>
         stopReasonRef.current ??
         "The run was told to stop, but nothing recorded why.";
+
+      // --- Large job: posts from an imported list, looked up 100 at a time. ---
+      if (mode === "job") {
+        if (!jobMeta) throw new Error("No large job has been imported");
+        setJobRunning(true);
+        const startCounts = await countJob();
+        const startLine = `Large job "${jobMeta.name}": ${startCounts.pending.toLocaleString()} of ${jobMeta.total.toLocaleString()} post(s) left to do.`;
+        logger.always(startLine);
+        void logRunNote(startLine);
+
+        // What's been downloaded since the job was imported (by this job or
+        // anything else) is checked again as each batch comes up.
+        const force = form.getValues("forceDownloadProcessed");
+        const history = force ? new Set<string>() : await getHistoryPostIds();
+        const processed = force
+          ? new Set<string>()
+          : new Set(await processedPostIds.getValue());
+        let lookupFailures = 0;
+        let batches = 0;
+        let jobStop: string | null = null;
+
+        while (alive()) {
+          setStep("reading the next posts of the job");
+          const batch = await nextPending(INFO_BATCH_SIZE);
+          if (batch.length === 0) break;
+
+          const already = batch.filter(
+            (link) => history.has(link.postId) || processed.has(link.postId),
+          );
+          await setStatuses(
+            already.map((link) => ({ postId: link.postId, status: "already" as const })),
+          );
+          const todo = batch.filter(
+            (link) => !history.has(link.postId) && !processed.has(link.postId),
+          );
+          if (todo.length === 0) continue;
+
+          setStep(`looking up ${todo.length} posts on Reddit`);
+          let lookup: Awaited<ReturnType<typeof fetchPostsMedia>>;
+          try {
+            lookup = await fetchPostsMedia(todo.map((link) => link.postId));
+            lookupFailures = 0;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            lookupFailures += 1;
+            const note = `Post lookup failed (${lookupFailures} of 3): ${message}`;
+            logger.error(note);
+            void logRunNote(note);
+            if (lookupFailures >= 3) {
+              jobStop = `Stopped: Reddit's post lookup failed 3 times in a row (${message}). Nothing was marked; Continue picks up from the same posts.`;
+              break;
+            }
+            await sleep(30_000 * lookupFailures);
+            continue;
+          }
+
+          const items: ScanPageMediaMessage["data"]["mediaUrls"] = [];
+          const nothing: { postId: string; status: "no-media"; reason: string }[] = [];
+          for (const link of todo) {
+            const found = lookup.get(link.postId);
+            if (!found || found.status !== "ok") {
+              nothing.push({
+                postId: link.postId,
+                status: "no-media",
+                reason: found?.status === "no-media" ? found.reason : "not found",
+              });
+            } else if (
+              !mediaTypeMatchesMassDownloadFilter(found.media.type, massDownloadMediaFilter)
+            ) {
+              nothing.push({
+                postId: link.postId,
+                status: "no-media",
+                reason: `media type ${found.media.type} filtered out (${massDownloadMediaFilter})`,
+              });
+            } else {
+              items.push({
+                urls: found.media.urls,
+                type: found.media.type,
+                subredditName: found.media.subredditName,
+                mediaPostId: link.postId,
+                postTitle: found.media.postTitle,
+                postAuthor: found.media.postAuthor,
+                postDate: found.media.postDate,
+              });
+            }
+          }
+          await setStatuses(nothing);
+          if (nothing.length > 0) countReasons({ "job-no-media": nothing.length });
+          setCurrentBatchCount(items.length);
+          addToTotalPostsFound(items.length);
+
+          const { succeeded, failed } = await downloadItems(items, false);
+          await setStatuses([
+            ...[...succeeded].map((postId) => ({ postId, status: "done" as const })),
+            ...[...failed].map(([postId, reason]) => ({
+              postId,
+              status: "failed" as const,
+              reason,
+            })),
+          ]);
+          for (const postId of succeeded) processed.add(postId);
+          await flushProcessedPostIds();
+          setCurrentPostInfo(null);
+
+          // A progress line in the run log every 10 batches (about 1,000 posts).
+          if (++batches % 10 === 0) {
+            const counts = await countJob();
+            void logRunNote(
+              `Job progress: ${counts.done} downloaded, ${counts.already} already had, ${counts["no-media"]} with nothing to download, ${counts.failed} failed, ${counts.pending} left.`,
+            );
+          }
+        }
+
+        setJobRunning(false);
+        const counts = await countJob();
+        const tally = `${counts.done.toLocaleString()} downloaded, ${counts.already.toLocaleString()} already had, ${counts.excluded.toLocaleString()} skipped by the skip file, ${counts["no-media"].toLocaleString()} with nothing to download, ${counts.failed.toLocaleString()} failed, ${counts.pending.toLocaleString()} left`;
+        if (jobStop) {
+          await finish("Large job stopped.", `${jobStop} ${tally}.`);
+        } else if (!alive()) {
+          await finish("Large job stopped. Continue picks up where it left off.", `${stoppedReason()} ${tally}.`);
+        } else {
+          await finish(
+            "Large job finished.",
+            `Finished the large job: ${tally}.` +
+              (counts.failed > 0 ? ' "Retry failed" puts the failed posts back in the job.' : ""),
+          );
+        }
+        return;
+      }
 
       // --- No queue: download the page the user is already looking at. ---
       if (queue.length === 0) {
@@ -1329,6 +1495,7 @@ function SidebarApp() {
    * the console, the run log and the report, and stop the heartbeat.
    */
   const endRun = async (note: string, reason: string) => {
+    setJobRunning(false);
     stopReasonRef.current = reason;
     runEndedAtRef.current = Date.now();
     stepRef.current = null;
@@ -1983,6 +2150,11 @@ function SidebarApp() {
         <HistoryPanel
           disabled={scrapingStatus.isScraping}
           onImported={() => resetProcessedPostIdCache()}
+        />
+        <JobPanel
+          running={scrapingStatus.isScraping}
+          jobRunning={jobRunning}
+          onStart={() => handleMassScrape(undefined, "job")}
         />
         <MemoryPanel />
       </div>

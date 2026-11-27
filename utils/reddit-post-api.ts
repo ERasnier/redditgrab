@@ -38,6 +38,11 @@ type RedditPostData = {
   secure_media?: RedditMedia;
   media_metadata?: Record<string, { s?: { u?: string; gif?: string } }>;
   gallery_data?: { items?: { media_id: string }[] };
+  name?: string;
+  is_self?: boolean;
+  removed_by_category?: string | null;
+  /** A crosspost carries its media on the original post. */
+  crosspost_parent_list?: RedditPostData[];
 };
 
 type RedditMedia = {
@@ -104,6 +109,10 @@ const extractMediaUrls = async (
       .map((u) => u.replace(/&amp;/g, "&"));
     if (urls.length > 0) return { type: "multiple-images", urls };
   }
+
+  // A crosspost: the media lives on the post it was crossposted from.
+  const parent = post.crosspost_parent_list?.[0];
+  if (parent && parent !== post) return extractMediaUrls(parent);
 
   return null;
 };
@@ -211,4 +220,96 @@ export const fetchPostThread = async (
     logger.warn(`Failed to fetch post thread for ${id}`, error);
     return null;
   }
+};
+
+export type BatchLookup =
+  | { status: "ok"; media: PostApiMedia }
+  | { status: "no-media"; reason: string };
+
+/** Posts per `/api/info` request; Reddit's own limit. */
+export const INFO_BATCH_SIZE = 100;
+
+const describeNoMedia = (post: RedditPostData) => {
+  if (post.removed_by_category) return `removed (${post.removed_by_category})`;
+  if (post.is_self) return "text post, no media";
+  if (post.domain) return `nothing downloadable from ${post.domain}`;
+  return "no downloadable media";
+};
+
+/**
+ * Look up to 100 posts at once through `/api/info`, for a large job: one
+ * request instead of a hundred. Posts Reddit doesn't return (deleted, banned
+ * subreddits, private) come back as "no-media" with a reason. Throws if the
+ * request itself fails, so the caller can retry the batch rather than mark a
+ * hundred posts as having nothing.
+ */
+export const fetchPostsMedia = async (
+  thingIds: string[],
+): Promise<Map<string, BatchLookup>> => {
+  const ids = thingIds.slice(0, INFO_BATCH_SIZE).map((id) =>
+    id.startsWith("t3_") ? id : `t3_${id}`,
+  );
+  const url = `https://www.reddit.com/api/info.json?raw_json=1&id=${ids.join(",")}`;
+  await waitForRequestSlot();
+  let res = await fetchWithTimeout(url, { credentials: "include" });
+  if (res.status === 429) {
+    const retryAfterSeconds = Number(res.headers.get("retry-after"));
+    const waitMs =
+      Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? Math.min(retryAfterSeconds * 1000, MAX_RETRY_AFTER_MS)
+        : 5000;
+    logger.warn(`Rate limited looking up ${ids.length} posts, retrying in ${waitMs}ms`);
+    nextRequestAt = Math.max(nextRequestAt, Date.now() + waitMs);
+    await waitForRequestSlot();
+    res = await fetchWithTimeout(url, { credentials: "include" });
+  }
+  const contentType = res.headers.get("content-type") ?? "";
+  if (!res.ok || !contentType.includes("json")) {
+    throw new Error(`Reddit's post lookup answered ${res.status} (${contentType || "no content type"})`);
+  }
+  const json = await res.json();
+  const posts: RedditPostData[] = (json?.data?.children ?? [])
+    .map((child: { data?: RedditPostData }) => child?.data)
+    .filter(Boolean);
+
+  const results = new Map<string, BatchLookup>();
+  for (const post of posts) {
+    const id = post.name;
+    if (!id) continue;
+    let media: { type: MediaContentType; urls: string[] } | null = null;
+    try {
+      media = await extractMediaUrls(post);
+    } catch (error) {
+      results.set(id, {
+        status: "no-media",
+        reason: `couldn't read the media: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      continue;
+    }
+    if (!media || media.urls.length === 0) {
+      results.set(id, { status: "no-media", reason: describeNoMedia(post) });
+      continue;
+    }
+    results.set(id, {
+      status: "ok",
+      media: {
+        ...media,
+        subredditName: post.subreddit || "unknown",
+        postTitle: post.title || "",
+        postAuthor: post.author || "unknown-user",
+        postDate: post.created_utc
+          ? format(fromUnixTime(post.created_utc), "yyyy-MM-dd")
+          : "",
+      },
+    });
+  }
+  for (const id of ids) {
+    if (!results.has(id)) {
+      results.set(id, {
+        status: "no-media",
+        reason: "Reddit didn't return the post (deleted, private or banned)",
+      });
+    }
+  }
+  return results;
 };

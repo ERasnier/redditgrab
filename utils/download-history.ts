@@ -1,4 +1,5 @@
-import initSqlJs, { type Database, type SqlJsStatic } from "sql.js";
+import type { Database } from "sql.js";
+import { withSql } from "./sqlite";
 import { logger } from "./logger";
 import { readExtensionFolderFile, writeExtensionFolderFile } from "./extension-folder";
 import { createBlobUrl, downloadAndRelease } from "./blob-utils";
@@ -123,6 +124,9 @@ export const getAllRecords = async (): Promise<HistoryRecord[]> => {
   return requestToPromise(db.transaction(STORE).objectStore(STORE).getAll());
 };
 
+/** Every post id in the history, for checking a large job against it. */
+export const getHistoryPostIds = () => getAllKeys();
+
 const getAllKeys = async (): Promise<Set<string>> => {
   const db = await openDb();
   const keys = await requestToPromise(
@@ -232,30 +236,6 @@ const mergeIntoProcessedList = async (ids: string[]) => {
 };
 
 // ---------------------------------------------------------------- SQLite
-
-let sqlPromise: Promise<SqlJsStatic> | null = null;
-let sqlUsers = 0;
-
-/**
- * Borrow the SQLite engine for one job, and let it go afterwards.
- *
- * A WebAssembly heap grows to fit the biggest database it has held and never
- * shrinks, so a cached engine kept the background page at the size of the
- * largest history file for the rest of the session. Loading it per job costs
- * a fraction of a second; dropping it lets the whole heap be collected.
- */
-const withSql = async <T>(job: (SQL: SqlJsStatic) => Promise<T> | T): Promise<T> => {
-  sqlUsers += 1;
-  try {
-    sqlPromise ??= initSqlJs({
-      locateFile: () => browser.runtime.getURL("/sqljs/sql-wasm.wasm"),
-    });
-    return await job(await sqlPromise);
-  } finally {
-    sqlUsers -= 1;
-    if (sqlUsers === 0) sqlPromise = null;
-  }
-};
 
 const SCHEMA = `
 CREATE TABLE downloads (
